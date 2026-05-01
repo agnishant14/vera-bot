@@ -21,7 +21,16 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import uvicorn
 
-from composer import compose, respond, is_auto_reply
+from composer import compose as _compose_llm, respond, is_auto_reply
+from rule_composer import compose_rule_based as _compose_rule
+
+def compose(category, merchant, trigger, customer=None):
+    """Try LLM composer first, fall back to rule-based if it fails."""
+    try:
+        return _compose_llm(category, merchant, trigger, customer)
+    except Exception as e:
+        log.warning(f"LLM composer failed ({e}), falling back to rule-based")
+        return _compose_rule(category, merchant, trigger, customer)
 
 # ---------------------------------------------------------------------------
 # Logging
