@@ -111,15 +111,16 @@ async def metadata():
     return {
         "team_name": "Team Vera",
         "team_members": ["Contestant"],
-        "model": "claude-sonnet-4-20250514",
+        "model": "gemini-1.5-flash",
         "approach": (
-            "4-context composer: trigger-kind routing → Claude prompt with merchant-specific "
-            "fact anchoring → post-LLM validation of CTA shape + language. "
-            "Auto-reply detection + intent-transition fast-paths for multi-turn."
+            "4-context composer: trigger-kind routing → Gemini prompt with merchant-specific "
+            "fact anchoring (CTR, views, offers, digest items, review themes). "
+            "Strict regex intent detection (no false positives on 'setup', 'audit' etc). "
+            "Rule-based fallback for all reply scenarios — never returns empty body."
         ),
         "contact_email": "contestant@example.com",
-        "version": "1.0.0",
-        "submitted_at": "2026-04-29T00:00:00Z",
+        "version": "2.0.0",
+        "submitted_at": "2026-05-02T00:00:00Z",
     }
 
 
