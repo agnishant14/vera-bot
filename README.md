@@ -1,54 +1,27 @@
-# Vera Bot
+# Vera Signal Engine
 
-magicpin AI challenge submission. FastAPI server that handles all 5 judge endpoints.
-
----
-
-## How it works
-
-Judges push context (merchants, categories, triggers) → bot composes a WhatsApp message using Gemini → judge plays the merchant and replies → bot handles the conversation.
-
-Three files that matter:
-
-- `app.py` — the server, all endpoints
-- `composer.py` — builds the message using Gemini API (temperature=0 for consistency)
-- `rule_composer.py` — deterministic fallback, no API needed
-
----
-
-## Run locally
-
-```bash
-pip install fastapi uvicorn pydantic httpx
-
-export GEMINI_API_KEY=your-key-here
-
-python app.py
-```
-
-Test it:
-```bash
-curl http://localhost:8080/v1/healthz
-```
-
----
-
-## Deploy
-
-Push to Railway, set `GEMINI_API_KEY` as an environment variable, submit the public URL.
-
----
+A deterministic, stateful solution to the magicpin AI Challenge. `bot.py` exposes the required `/v1/healthz`, `/v1/metadata`, `/v1/context`, `/v1/tick`, and `/v1/reply` endpoints plus optional `/v1/teardown`. It also exports the standalone `compose(category, merchant, trigger, customer=None)` contract. `submission.jsonl` contains all 30 canonical compositions.
 
 ## Approach
 
-Gave Gemini the full merchant context — real CTR numbers, active offers, peer benchmarks, conversation history — and told it to write one specific message per trigger. Auto-reply detection and intent transitions are handled with regex before touching the API, so common cases are fast and don't waste calls.
+The engine ranks triggers by urgency and decision value, sends at most one action per merchant/customer entity in a tick, and composes from only the latest received category, merchant, trigger, and customer records. Category strategies cover research, regulation, performance, planning, review, competition, events, retention, appointments, recalls, refill, and win-back flows. Unknown trigger kinds use a conservative fact-only fallback.
 
-Biggest tradeoff: everything is in-memory, which is fine for a 60-minute eval window.
+Operational safeguards include atomic context versioning, 500 KB context limits, suppression-key deduplication, customer-consent checks, category/trigger compatibility checks, first-touch template metadata, no-URL validation, 20-action caps, opt-out muting, and teardown wiping. Reply routing detects canned auto-replies across conversations (send once → wait → end), switches commitments directly to action, stops on hostility/declines, and keeps off-topic requests within Vera's scope.
 
----
+## Tradeoffs
 
-## What would've helped
+The solution uses no runtime LLM. This gives sub-second, reproducible responses and removes API cost, availability, and hallucination risk. The tradeoff is less linguistic variety than a frontier model; the strategy library and grounded adaptive fallback are designed to preserve decision quality on fresh judge injections. State is in memory, which matches the challenge contract but requires a single long-lived process during evaluation.
 
-- Real merchant reply examples per category (the intent classifier is regex-based right now)
-- Actual slot availability data for booking flows
-- Magicpin's production suppression windows
+## Run and verify
+
+```bash
+python3 -m pip install -r requirements.txt
+uvicorn bot:app --host 0.0.0.0 --port 8080
+python3 -m unittest discover -s tests -v
+python3 dataset/generate_dataset.py --seed-dir dataset --out expanded
+python3 generate_submission.py
+```
+
+For Docker: `docker build -t vera-signal-engine .` then `docker run -p 8080:8080 vera-signal-engine`. `render.yaml` and `Procfile` are included for public deployment. Set `TEAM_NAME`, `TEAM_MEMBERS`, and `CONTACT_EMAIL` before submission.
+
+The most useful additional context would be real slot/inventory data for generated placeholder triggers and explicit per-trigger consent scopes; when absent, the engine avoids inventing those details.
