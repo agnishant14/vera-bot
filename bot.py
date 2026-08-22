@@ -792,6 +792,7 @@ STOP_PATTERNS = (
 COMMIT_PATTERNS = (
     r"let'?s do it", r"go ahead", r"proceed", r"what'?s next", r"i want to join",
     r"mujhe.*judna", r"mujhe.*join", r"kar do", r"confirm", r"yes please", r"sounds good",
+    r"\b(send|share|pull|show) me\b", r"\bplease (send|share|pull|show)\b",
 )
 DECLINE_PATTERNS = (r"\bno\b", r"not now", r"later", r"maybe later", r"nahi", r"cancel")
 
