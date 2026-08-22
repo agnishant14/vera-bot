@@ -21,6 +21,22 @@ uvicorn bot:app --host 0.0.0.0 --port 8080
 
 Starting the server does not print the challenge lifecycle or sample responses in the terminal. It starts a JSON API. Open [http://localhost:8080/docs](http://localhost:8080/docs) for interactive API documentation, or call the endpoints below from another terminal.
 
+To load the complete expanded dataset automatically, keep the server running and use a second terminal:
+
+```bash
+python3 load_contexts.py --tick
+```
+
+This discovers the standard sibling `magicpin-ai-challenge/expanded` folder and loads all categories, merchants, customers, and triggers. To provide the folder explicitly:
+
+```bash
+python3 load_contexts.py \
+  --expanded-dir /path/to/magicpin-ai-challenge/expanded \
+  --tick
+```
+
+The loader prints the loaded context counts, health response, and any actions returned by the tick. Use `--url https://your-deployed-host.example` when testing a deployed service.
+
 ## API quickstart
 
 Every JSON `POST` must include `Content-Type: application/json`. A tick can create an action only after its category, merchant, and trigger contexts have been loaded.
