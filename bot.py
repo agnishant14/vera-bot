@@ -13,14 +13,52 @@ import os
 import re
 import threading
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from fastapi import FastAPI, Response
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+try:  # Keep the standalone compose contract usable without HTTP dependencies.
+    from fastapi import FastAPI, Response
+    from fastapi.exceptions import RequestValidationError
+    from fastapi.responses import JSONResponse
+    from pydantic import BaseModel, ConfigDict, Field
+    HTTP_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised by lightweight submission runners.
+    HTTP_AVAILABLE = False
+
+    class BaseModel:
+        """Minimal declaration-only fallback used by the static composer."""
+
+    def ConfigDict(**kwargs: Any) -> dict[str, Any]:
+        return kwargs
+
+    def Field(default: Any = None, **_kwargs: Any) -> Any:
+        return default
+
+    class Response:
+        status_code = 200
+
+    class RequestValidationError(Exception):
+        def errors(self) -> list[dict[str, Any]]:
+            return []
+
+    class JSONResponse(dict):
+        def __init__(self, status_code: int = 200, content: Any = None, **_kwargs: Any) -> None:
+            super().__init__(content or {})
+            self.status_code = status_code
+
+    class FastAPI:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        def get(self, *_args: Any, **_kwargs: Any):
+            return lambda function: function
+
+        def post(self, *_args: Any, **_kwargs: Any):
+            return lambda function: function
+
+        def exception_handler(self, *_args: Any, **_kwargs: Any):
+            return lambda function: function
 
 
 VERSION = "1.0.0"
@@ -54,6 +92,21 @@ def _pct(value: Any, signed: bool = False) -> str | None:
     rounded = round(number)
     rendered = str(rounded) if abs(number - rounded) < 0.05 else f"{number:.1f}"
     return f"{sign}{rendered}%"
+
+
+def _change_phrase(value: Any, fallback: str = "changed") -> str:
+    """Render a percentage as natural-language direction plus magnitude."""
+    try:
+        number = float(value) * 100
+    except (TypeError, ValueError):
+        return fallback
+    rounded = round(abs(number))
+    magnitude = str(rounded) if abs(abs(number) - rounded) < 0.05 else f"{abs(number):.1f}"
+    if number < 0:
+        return f"down {magnitude}%"
+    if number > 0:
+        return f"up {magnitude}%"
+    return "flat"
 
 
 def _money(value: Any) -> str:
@@ -114,7 +167,7 @@ def _merchant_salutation(category: dict[str, Any], merchant: dict[str, Any]) -> 
     owner = _clean(_get(merchant, "identity", "owner_first_name"))
     if category.get("slug") == "dentists":
         if owner:
-            return f"Dr. {owner}"
+            return owner if owner.lower().startswith("dr.") else f"Dr. {owner}"
         name = _merchant_name(merchant)
         return name if name.lower().startswith("dr.") else f"Dr. {name}"
     return owner or _merchant_name(merchant)
@@ -289,10 +342,10 @@ def _merchant_message(category: dict[str, Any], merchant: dict[str, Any], trigge
         if delta is None:
             inferred = _strongest_delta(merchant, "down")
             metric, delta = inferred if inferred else ("calls", None)
-        change = _pct(delta) or "down"
+        change = _change_phrase(delta, "down")
         current = performance.get(metric)
         current_text = f"; current 30-day {metric} are {int(current):,}" if isinstance(current, (int, float)) else ""
-        seasonal = " This is marked as the normal Apr–Jun post-resolution lull, not a demand collapse." if payload.get("is_expected_seasonal") else ""
+        seasonal = f" This is marked as the expected seasonal lull ({_humanize(payload.get('season_note'))}), not a demand collapse." if payload.get("is_expected_seasonal") else ""
         proof = f" You still have {int(aggregate['total_active_members'])} active members." if aggregate.get("total_active_members") else ""
         next_step = {
             "dentists": "a profile fix focused on calls",
@@ -350,7 +403,7 @@ def _merchant_message(category: dict[str, Any], merchant: dict[str, Any], trigge
         lapsed = payload.get("lapsed_customers_added_since_expiry") or aggregate.get("lapsed_90d_plus") or aggregate.get("lapsed_180d_plus")
         facts = [f"it has been {int(days)} days" if days else "we have not heard from you recently"]
         if dip is not None:
-            facts.append(f"calls are {_pct(dip)}")
+            facts.append(f"calls are {_change_phrase(dip, 'down')}")
         if lapsed:
             facts.append(f"{int(lapsed)} customers are now lapsed")
         body = f"{salutation}, quick reset: {_compact_list(facts)}. I can focus on one outcome first — bookings or customer win-back. Reply BOOKINGS or WINBACK; I will draft that plan only."
@@ -445,11 +498,15 @@ def _customer_message(category: dict[str, Any], merchant: dict[str, Any], trigge
 
     if kind == "appointment_tomorrow":
         appointment = payload.get("appointment") or payload.get("appointment_time") or payload.get("slot")
-        timing = _date_label(appointment, include_time=True) if appointment else "the booked time"
         visits = relationship.get("visits_total")
         relationship_fact = f" We have {int(visits)} visit{'s' if int(visits) != 1 else ''} on your record." if isinstance(visits, (int, float)) else ""
         line = "Kal aapki appointment hai." if "hi" in pref else "Your appointment is tomorrow."
-        body = f"{prefix} {line}{relationship_fact} Scheduled time: {timing}. Reply CONFIRM to keep it or RESCHEDULE if you need another time."
+        if appointment:
+            timing = _date_label(appointment, include_time=True)
+            schedule = f" Scheduled time: {timing}." if timing else ""
+        else:
+            schedule = " I do not have the exact slot in this reminder update."
+        body = f"{prefix} {line}{relationship_fact}{schedule} Reply CONFIRM to keep it or RESCHEDULE if you need another time."
         return body, "binary_confirm_reschedule", "Operational next-day reminder, merchant attribution, language preference, and one booking CTA."
 
     if kind == "recall_due":
@@ -579,7 +636,6 @@ class StateStore:
         self.contexts: dict[tuple[str, str], dict[str, Any]] = {}
         self.conversations: dict[str, dict[str, Any]] = {}
         self.sent_suppression_keys: set[str] = set()
-        self.merchant_reply_fingerprints: dict[str, Counter[str]] = defaultdict(Counter)
         self.muted_merchants: set[str] = set()
 
     def clear(self) -> None:
@@ -587,7 +643,6 @@ class StateStore:
             self.contexts.clear()
             self.conversations.clear()
             self.sent_suppression_keys.clear()
-            self.merchant_reply_fingerprints.clear()
             self.muted_merchants.clear()
 
     def put_context(self, body: ContextBody) -> tuple[bool, int | None]:
@@ -696,8 +751,14 @@ def _priority(trigger: dict[str, Any]) -> tuple[int, int, str]:
 
 
 def _conversation_id(trigger: dict[str, Any]) -> str:
+    # Keep IDs resumable and human-auditable while retaining a deterministic
+    # hash suffix to avoid collisions when trigger names are very similar.
+    merchant = re.sub(r"[^a-z0-9]+", "_", (_trigger_merchant_id(trigger) or "merchant").lower()).strip("_")
+    customer = re.sub(r"[^a-z0-9]+", "_", (_trigger_customer_id(trigger) or "merchant").lower()).strip("_")
+    kind = re.sub(r"[^a-z0-9]+", "_", (_clean(trigger.get("kind")) or "context").lower()).strip("_")
     raw = f"{_trigger_merchant_id(trigger)}|{_trigger_customer_id(trigger)}|{trigger.get('id')}|{trigger.get('suppression_key')}"
-    return f"conv_{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:20]}"
+    suffix = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+    return f"conv_{merchant[:28]}_{customer[:20]}_{kind[:24]}_{suffix}"
 
 
 def _normalise_reply(message: str) -> str:
@@ -924,8 +985,12 @@ def reply(body: ReplyBody) -> dict[str, Any]:
 
         looks_automatic = _matches_any(message, AUTO_REPLY_PATTERNS)
         if looks_automatic:
-            STORE.merchant_reply_fingerprints[merchant_id][normalized] += 1
-            count = STORE.merchant_reply_fingerprints[merchant_id][normalized]
+            # Count identical canned replies within this conversation. A
+            # separate conversation from the same merchant must not inherit a
+            # prior auto-reply streak.
+            fingerprints = state.setdefault("auto_reply_fingerprints", Counter())
+            fingerprints[normalized] += 1
+            count = fingerprints[normalized]
             state["auto_reply_count"] = max(int(state.get("auto_reply_count", 0)), count)
             if count >= 3:
                 return {"action": "end", "rationale": "The same canned auto-reply was seen three times; no human engagement signal remains."}
@@ -938,9 +1003,9 @@ def reply(body: ReplyBody) -> dict[str, Any]:
                 "rationale": "First canned response detected; one concise owner-directed prompt before backing off.",
             }
 
-        # A real human reply resets repeated-auto-reply memory for this merchant.
+        # A real human reply resets the auto-reply streak for this conversation.
         if normalized:
-            STORE.merchant_reply_fingerprints[merchant_id].clear()
+            state.setdefault("auto_reply_fingerprints", Counter()).clear()
 
         if _matches_any(message, COMMIT_PATTERNS):
             response_body = _commitment_response(category, merchant, trigger, body.turn_number)
@@ -950,11 +1015,12 @@ def reply(body: ReplyBody) -> dict[str, Any]:
             return {"action": "end", "rationale": "Clear decline or request to defer; ending without another persuasion attempt."}
 
         if re.search(r"\b(gst|tax|loan|legal|passport|aadhaar)\b", normalized):
+            trigger_kind = _humanize(trigger.get("kind")) if trigger else "the current Vera task"
             return {
                 "action": "send",
-                "body": "I can’t handle GST, tax, or legal filing. I can help with your magicpin listing, customer messages, offers, and campaign drafts; message me when you want to continue there.",
-                "cta": "none",
-                "rationale": "Off-topic request acknowledged without inventing capability; gently returns to Vera's merchant-growth scope.",
+                "body": f"I’ll leave GST, tax, or legal filing to your CA. I can help with {trigger_kind}, your magicpin listing, customer messages, offers, and campaign drafts. Reply DRAFT to continue here or STOP to close.",
+                "cta": "open_ended",
+                "rationale": "Off-topic request is declined without inventing capability, then routed back to the active trigger with one clear continuation.",
             }
 
         if "?" in message or re.search(r"\b(what|how|when|where|kitna|kaise|kab)\b", normalized):
