@@ -1,0 +1,11 @@
+# Python-generated files
+__pycache__/
+*.py[cod]
+
+# macOS metadata
+.DS_Store
+
+# Local test output and secrets
+judge-*-output.txt
+.env
+.venv/
