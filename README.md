@@ -18,11 +18,11 @@ The solution uses no runtime LLM. This gives sub-second, reproducible responses 
 python3 -m pip install -r requirements.txt
 uvicorn bot:app --host 0.0.0.0 --port 8080
 python3 -m unittest discover -s tests -v
-python3 generate_submission.py --expanded-dir /Users/nishantagarwal/Desktop/magicpin-ai-challenge/expanded
+python3 generate_submission.py --expanded-dir /path/to/magicpin-ai-challenge/expanded
 ```
 
 For Docker: `docker build -t vera-signal-engine .` then `docker run -p 8080:8080 vera-signal-engine`. `render.yaml` and `Procfile` are included for public deployment. Set `TEAM_NAME`, `TEAM_MEMBERS`, and `CONTACT_EMAIL` before submission.
 
-If you keep the expanded challenge folder elsewhere, pass that path to `--expanded-dir`; the generator also auto-discovers the common sibling-folder layout.
+If the expanded challenge folder is available in the standard sibling-folder layout, the generator finds it automatically. Otherwise, pass its local path with `--expanded-dir` as shown above. The path is only used during local submission generation and is not part of the deployed service.
 
 The most useful additional context would be real slot/inventory data for generated placeholder triggers and explicit per-trigger consent scopes; when absent, the engine avoids inventing those details.
