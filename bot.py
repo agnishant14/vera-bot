@@ -79,6 +79,17 @@ def _clean(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
+def _json_safe(value: Any) -> Any:
+    """Convert validation details into JSON-safe diagnostic data."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
 def _humanize(value: Any) -> str:
     return _clean(value).replace("_", " ").replace("+", " +")
 
@@ -839,7 +850,7 @@ app = FastAPI(
 async def request_validation_error(_request: Any, exc: RequestValidationError) -> JSONResponse:
     return JSONResponse(
         status_code=400,
-        content={"accepted": False, "reason": "malformed_request", "details": exc.errors()},
+        content={"accepted": False, "reason": "malformed_request", "details": _json_safe(exc.errors())},
     )
 
 
@@ -859,7 +870,7 @@ def healthz() -> dict[str, Any]:
 
 @app.get("/v1/metadata")
 def metadata() -> dict[str, Any]:
-    members = [item.strip() for item in os.getenv("TEAM_MEMBERS", "Nishant Agarwal").split(",") if item.strip()]
+    members = [item.strip() for item in os.getenv("TEAM_MEMBERS", "Vera Team").split(",") if item.strip()]
     return {
         "team_name": os.getenv("TEAM_NAME", "Vera Signal Engine"),
         "team_members": members,
