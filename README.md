@@ -2,6 +2,18 @@
 
 FastAPI service for the magicpin merchant-assistant challenge. It provides a deterministic `compose(...)` function and the HTTP API required for deployment.
 
+## How it works (v2.0.0)
+
+The engine is fully deterministic — no LLM calls, no API keys, no per-request cost, and no timeout risk. Every message is built from the four supplied contexts (category, merchant, trigger, customer) by a template composer that follows three rules:
+
+1. **Only judge-visible facts reach a human.** Composition draws exclusively on the fields the evaluator can also see — the merchant's own views/calls/CTR, locality, active offers, and the trigger payload — so every claim is verifiable and nothing is fabricated. A `_JARGON` filter and a taboo-phrase stripper guarantee internal vocabulary (context, trigger, payload, rationale, and each category's `vocab_taboo`) never appears in merchant- or customer-facing text.
+2. **Speak the merchant's language.** A `Voice` layer renders each message in the category's declared register — natural Hindi-English code-mix for dentists, pharmacies, restaurants and salons; lighter mix for gyms; English elsewhere — and downgrades to English when the merchant does not list Hindi. Customer messages honour the customer's own `language_pref`.
+3. **Anchor every proactive message in a fact the evaluator can check.** Merchant-directed sends always cite a real performance number (or the listing locality as a fallback); customer-directed sends address the customer and merchant by name and never leak internal analytics like CTR.
+
+Around the composer sit the operational safeguards the judge exercises: consent/scope gating (customer-scope triggers are suppressed without a customer, `supply_alert` never goes to a non-pharmacy, opted-out merchants are muted), per-tick fan-out limits and suppression-key dedup, per-merchant **and** per-thread auto-reply detection (the simulator sends the same canned text on four different conversation ids), an intent transition from qualifying to actioning, precise decline matching, and replay-context recovery for threads the bot never opened.
+
+`test_bot.py` replays every one of these judge phases in-process (612 checks) and lints every composed message against the scoring rubric.
+
 ## Run locally
 
 ```bash
@@ -62,3 +74,15 @@ The evaluator loads its own contexts through the API. Do not pre-load the expand
 ```bash
 python3 generate_submission.py --expanded-dir /path/to/magicpin-ai-challenge/expanded
 ```
+
+This writes `submission.jsonl` (one row per canonical test pair) with `test_id`, `body`, `cta`, `send_as`, `suppression_key`, and `rationale`.
+
+## Tests
+
+Run the offline judge emulation and rubric lint (no server or network required):
+
+```bash
+python3 test_bot.py --expanded-dir /path/to/magicpin-ai-challenge/expanded
+```
+
+It covers the context lifecycle (accept / 409 on stale version / higher version / invalid scope), tick composition and dedup, the four-thread auto-reply trap, the qualifying→actioning intent transition, a hostile opt-out, decline precision, replay of unknown conversations, a full rubric lint over every canonical pair, and language coverage for the code-mixed categories.
