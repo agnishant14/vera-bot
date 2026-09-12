@@ -42,7 +42,7 @@ def check(condition: bool, label: str) -> bool:
 
 
 def default_expanded_dir() -> Path:
-    for candidate in (ROOT / "expanded", ROOT.parent / "magicpin-ai-challenge" / "expanded", ROOT.parent / "magicpin" / "expanded"):
+    for candidate in (ROOT / "expanded", ROOT.parent / "magicpin-ai-challenge" / "expanded", ROOT.parent / "magicpin" / "expanded", Path.home() / "Downloads" / "magicpin-ai-challenge" / "expanded"):
         if (candidate / "test_pairs.json").is_file():
             return candidate
     raise FileNotFoundError("Expanded fixtures not found; pass --expanded-dir")
@@ -219,7 +219,7 @@ def test_decline_precision(fx):
     check(result["action"] == "send", "decline: a question containing 'no' must still be answered")
 
     result = do_reply("conv_q_2", "Can you send me the draft later today?", turn=2, merchant_id=merchant_id)
-    check(result["action"] == "send", "decline: 'later' inside a request must not read as a refusal")
+    check(result["action"] == "wait", "timing: a request for later must defer instead of ending or sending immediately")
 
     result = do_reply("conv_d_1", "Not interested", turn=2, merchant_id=merchant_id)
     check(result["action"] == "end", "decline: a clear refusal must end the conversation")
@@ -302,6 +302,131 @@ def test_language_coverage(fx):
     check(len(seen) >= 3, "language: expected several code-mixed categories in the canonical pairs")
 
 
+def test_useful_replies(fx):
+    """Exercise real outputs, not just words such as 'done' or 'draft'."""
+    import copy
+
+    def open_thread(kind):
+        warmup(fx)
+        trigger = next(t for t in fx["triggers"].values() if t["kind"] == kind and not t.get("payload", {}).get("placeholder"))
+        action = do_tick([trigger["id"]])["actions"][0]
+        return action, trigger
+
+    action, trigger = open_thread("regulation_change")
+    mid, cid = action["merchant_id"], action["conversation_id"]
+    answer = do_reply(cid, "Yes", 1, mid)
+    check("1)" in answer.get("body", "") and "2)" in answer["body"], "delivery: acceptance must return an actual checklist")
+    check("E-speed" in answer["body"] and "RVG" in answer["body"], "delivery: checklist must include the requested notice's equipment details")
+    approved = do_reply(cid, "CONFIRM", 2, mid)
+    check(approved.get("body") != answer["body"], "delivery: confirmation must advance without repeating the draft")
+    check(bot.STORE.conversations[cid].get("approved"), "delivery: record approval on the thread")
+    check(approved.get("cta") != "binary_confirm_edit", "delivery: do not demand confirmation of a confirmation")
+
+    action, trigger = open_thread("perf_dip")
+    mid, cid = action["merchant_id"], action["conversation_id"]
+    answer = do_reply(cid, "Send me the draft", 1, mid)
+    check(bot._merchant_name(fx["merchants"][mid]) in answer["body"], "delivery: post contains merchant name")
+    check("Message" in answer["body"] or "message" in answer["body"], "delivery: post contains actual customer call to action")
+    price = do_reply(cid, "No, what is the price?", 2, mid)
+    check(price["action"] == "send" and "DRAFT" not in price["body"], "question: price question gets an answer, not an invitation to ask again")
+    waiting = do_reply(cid, "Yes, but give me 30 minutes", 3, mid)
+    check(waiting["action"] == "wait" and waiting.get("wait_seconds") == 1800, "timing: specific delay wins over acceptance")
+    tax = do_reply(cid, "Please send me help to file my GST", 4, mid)
+    check(tax["action"] == "send" and ("tax professional" in tax["body"]), "scope: action phrasing must not bypass the tax-advice boundary")
+    stop_loss = do_reply("loss_question", "How can I stop losing customers?", 1, mid)
+    check(stop_loss["action"] == "send" and mid not in bot.STORE.muted_merchants, "intent: 'stop losing customers' is not an opt-out")
+
+    action, trigger = open_thread("active_planning_intent")
+    mid, cid = action["merchant_id"], action["conversation_id"]
+    join = do_reply(cid, "I want to join magicpin", 1, mid)
+    check("registration" in join["body"] and "current numbers" not in join["body"], "onboarding: joining intent gets registration steps")
+    voice = do_reply("english_request", "Please send the draft in English", 1, mid)
+    check(not re.search(r"\b(bhejiye|kijiye|hai|aapki)\b", voice["body"]), "language: explicit per-turn English preference wins")
+
+    action, trigger = open_thread("research_digest")
+    mid, cid = action["merchant_id"], action["conversation_id"]
+    slug = fx["merchants"][mid]["category_slug"]
+    category = copy.deepcopy(fx["categories"][slug])
+    item_id = trigger["payload"]["top_item_id"]
+    for item in category["digest"]:
+        if item["id"] == item_id:
+            item["summary"] = "Updated controlled study enrolled 3,217 adults; no effect was found in the comparison group."
+    push("category", slug, category, version=2)
+    result = do_reply(cid, "Send me the abstract", 1, mid)
+    check("3,217" in result["body"] and "38%" not in result["body"], "adaptation: an open thread uses updated category data")
+    merchant = copy.deepcopy(fx["merchants"][mid])
+    merchant["performance"]["views"] = 8765
+    push("merchant", mid, merchant, version=2)
+    do_reply(cid, "How does this apply?", 2, mid)
+    check(bot.STORE.conversations[cid]["merchant"]["performance"]["views"] == 8765, "adaptation: an open thread refreshes merchant data")
+
+    updated_trigger = copy.deepcopy(trigger)
+    updated_trigger["payload"]["top_item_id"] = "missing_source"
+    push("trigger", trigger["id"], updated_trigger, version=2)
+    missing = do_reply(cid, "Please share the source?", 3, mid)
+    check("missing" in missing["body"] or "nahi hai" in missing["body"], "adaptation: a missing referenced source must not silently select a different study")
+    check("3,217" not in missing["body"], "adaptation: missing source must not borrow another finding")
+
+
+def test_customer_reply_isolation(fx):
+    import copy
+    warmup(fx)
+    trigger = next(t for t in fx["triggers"].values() if t["kind"] == "recall_due" and t.get("payload", {}).get("available_slots"))
+    action = do_tick([trigger["id"]])["actions"][0]
+    mid, cid, customer_id = action["merchant_id"], action["conversation_id"], action["customer_id"]
+
+    def customer_reply(message, turn):
+        return bot.reply(SimpleNamespace(conversation_id=cid, merchant_id=mid, customer_id=customer_id,
+            from_role="customer", message=message, received_at="2026-04-26T10:00:00Z", turn_number=turn))
+
+    selected = customer_reply("1", 1)
+    check("5 Nov" in selected["body"], "customer: numeric slot selection must resolve to the real time")
+    check("CTR" not in selected["body"] and "views" not in selected["body"], "customer: replies must not leak merchant analytics")
+    check(bot.STORE.conversations[cid].get("requested_slot"), "customer: retain slot choice for subsequent turns")
+    check("not confirmed" in selected["body"] or "confirm nahi" in selected["body"], "customer: request must not be misrepresented as completed booking")
+    customer_reply("STOP", 2)
+    check(customer_id in bot.STORE.muted_customers, "customer: opt-out is stored for this customer")
+    check(mid not in bot.STORE.muted_merchants, "customer: customer opt-out does not mute merchant")
+    fresh = copy.deepcopy(trigger)
+    fresh["id"], fresh["suppression_key"] = "new_customer_reminder", "new_customer_reminder_key"
+    push("trigger", fresh["id"], fresh)
+    check(not do_tick([fresh["id"]])["actions"], "customer: opt-out blocks later proactive reminders")
+    merchant_trigger = next(t for t in fx["triggers"].values() if t.get("merchant_id") == mid and t["scope"] == "merchant")
+    check(bool(do_tick([merchant_trigger["id"]])["actions"]), "customer: merchant remains reachable after customer opt-out")
+
+
+def test_grounding_and_dedup(fx):
+    import copy
+    warmup(fx)
+    # Two different recipients can be queued with the same suppression key.
+    eligible = [t for t in fx["triggers"].values() if t["scope"] == "merchant" and t["kind"] == "perf_dip"][:2]
+    ids = []
+    for index, original in enumerate(eligible):
+        t = copy.deepcopy(original)
+        t["id"], t["suppression_key"] = f"duplicate_{index}", "shared_once"
+        push("trigger", t["id"], t)
+        ids.append(t["id"])
+    check(len(do_tick(ids)["actions"]) == 1, "dedup: same suppression key cannot be sent twice within one tick")
+
+    match = next(t for t in fx["triggers"].values() if t["kind"] == "ipl_match_today" and not t["payload"].get("placeholder"))
+    merchant = fx["merchants"][match["merchant_id"]]
+    category = fx["categories"][merchant["category_slug"]]
+    result = bot.compose(category, merchant, match)
+    check("Tue-Thu" not in result["body"], "grounding: Sunday match must not promote a Tuesday-Thursday offer")
+    planning = next(t for t in fx["triggers"].values() if t["kind"] == "active_planning_intent" and "kids" in str(t["payload"]))
+    merchant = fx["merchants"][planning["merchant_id"]]
+    result = bot.compose(fx["categories"][merchant["category_slug"]], merchant, planning)
+    check("₹499" not in result["body"], "grounding: existing membership price must not become the kids camp fee")
+    check("draft" in result["body"].lower(), "planning: first message must deliver usable copy")
+
+    expired = {"kind": "perf_dip", "scope": "merchant", "expires_at": "2026-04-26"}
+    check(not bot._trigger_quality(expired, category, None, "2026-04-26T09:00:00Z"), "expiry: date-only expiry is handled without a timezone exception")
+    body = bot._finalize("Useful source detail. " * 100 + "Reply YES, or STOP.")
+    check(len(body) <= 900 and body.endswith("Reply YES, or STOP."), "length: large injected text must preserve the final CTA")
+    category = {"offer_catalog": [{"title": "Flat 30% OFF"}, {"title": "Lunch Thali @ ₹149"}]}
+    check(bot._catalog_offer(category) == "Lunch Thali @ ₹149", "offers: prefer service-plus-price over flat discounts")
+
+
 def test_healthz_and_metadata():
     health = bot.healthz()
     check(health.get("status") == "ok", "healthz: must report ok")
@@ -309,6 +434,44 @@ def test_healthz_and_metadata():
     meta = bot.metadata()
     for field in ("team_name", "team_members", "approach", "version"):
         check(bool(meta.get(field)), f"metadata: {field} must be populated")
+
+
+def test_followup_regressions(fx):
+    warmup(fx)
+    planning = next(t for t in fx["triggers"].values() if t["kind"] == "active_planning_intent" and not t.get("payload", {}).get("placeholder"))
+    action = do_tick([planning["id"]])["actions"][0]
+    cid, mid = action["conversation_id"], action["merchant_id"]
+    original = bot.STORE.conversations[cid].get("delivered")
+    approved = do_reply(cid, "APPROVE", 1, mid)
+    check(original == action["body"], "approval: retain the draft delivered in the opening message")
+    check(bot.STORE.conversations[cid].get("approved"), "approval: advertised APPROVE command must approve the opening draft")
+    check(approved.get("body") != original, "approval: do not repeat the planning pitch after approval")
+
+    warmup(fx)
+    match = next(t for t in fx["triggers"].values() if t["kind"] == "ipl_match_today" and not t.get("payload", {}).get("placeholder"))
+    action = do_tick([match["id"]])["actions"][0]
+    cid, mid = action["conversation_id"], action["merchant_id"]
+    draft = do_reply(cid, "Cutoff is 10:30pm", 1, mid)
+    check("10:30pm" in draft.get("body", "") and "DC vs MI" in draft["body"], "match: supplied cutoff produces a usable match-specific draft")
+    check("Tue-Thu" not in draft["body"], "match: cutoff follow-up must not reintroduce an invalid weekday offer")
+    check(bot.STORE.conversations[cid].get("delivered") == draft["body"], "match: retain the draft for approval")
+    do_reply(cid, "APPROVE", 2, mid)
+    check(bot.STORE.conversations[cid].get("approved"), "match: approve the delivered cutoff draft")
+    price = do_reply(cid, "Can you share the price?", 3, mid)
+    check("Tue-Thu" not in price["body"] and "subscription" not in price["body"], "match: price question must not quote a weekday deal or Vera subscription")
+
+    warmup(fx)
+    action = do_tick([match["id"]])["actions"][0]
+    draft = do_reply(action["conversation_id"], "Yes", 1, mid)
+    check("DC vs MI" in draft["body"] and "Tue-Thu" not in draft["body"], "match: simple acceptance must keep event details and offer restrictions")
+
+    warmup(fx)
+    performance = {**match, "kind": "perf_dip"}
+    push("trigger", performance["id"], performance, version=2)
+    action = do_tick([performance["id"]])["actions"][0]
+    price = do_reply(action["conversation_id"], "Can you share the price?", 1, action["merchant_id"])
+    offer = bot._best_offer(fx["merchants"][action["merchant_id"]])
+    check(offer in price["body"], "price: conversational 'you' must not turn a service-price question into a subscription question")
 
 
 def main() -> int:
@@ -327,6 +490,10 @@ def main() -> int:
         lambda: test_replay_unknown_conversation(fx),
         lambda: test_composition_rubric(fx),
         lambda: test_language_coverage(fx),
+        lambda: test_useful_replies(fx),
+        lambda: test_customer_reply_isolation(fx),
+        lambda: test_grounding_and_dedup(fx),
+        lambda: test_followup_regressions(fx),
         test_healthz_and_metadata,
     ):
         suite()

@@ -2,7 +2,7 @@
 
 FastAPI service for the magicpin merchant-assistant challenge. It provides a deterministic `compose(...)` function and the HTTP API required for deployment.
 
-## How it works (v2.0.0)
+## How it works (v2.1.0)
 
 The engine is fully deterministic — no LLM calls, no API keys, no per-request cost, and no timeout risk. Every message is built from the four supplied contexts (category, merchant, trigger, customer) by a template composer that follows three rules:
 
@@ -12,7 +12,7 @@ The engine is fully deterministic — no LLM calls, no API keys, no per-request 
 
 Around the composer sit the operational safeguards the judge exercises: consent/scope gating (customer-scope triggers are suppressed without a customer, `supply_alert` never goes to a non-pharmacy, opted-out merchants are muted), per-tick fan-out limits and suppression-key dedup, per-merchant **and** per-thread auto-reply detection (the simulator sends the same canned text on four different conversation ids), an intent transition from qualifying to actioning, precise decline matching, and replay-context recovery for threads the bot never opened.
 
-`test_bot.py` replays every one of these judge phases in-process (612 checks) and lints every composed message against the scoring rubric.
+`test_bot.py` replays these judge phases in-process and lints every composed message against the scoring rubric. It also checks draft approval, source updates, price questions, and date-valid offers throughout the IPL follow-up flow.
 
 ## Run locally
 

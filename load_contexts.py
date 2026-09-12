@@ -23,6 +23,7 @@ def default_expanded_dir() -> Path:
         ROOT / "expanded",
         ROOT.parent / "magicpin-ai-challenge" / "expanded",
         ROOT.parent / "magicpin" / "expanded",
+        Path.home() / "Downloads" / "magicpin-ai-challenge" / "expanded",
     )
     for candidate in candidates:
         if (candidate / "test_pairs.json").is_file():

@@ -62,7 +62,7 @@ except ImportError:  # pragma: no cover - exercised by lightweight submission ru
             return lambda function: function
 
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 STARTED_AT = time.time()
 VALID_SCOPES = {"category", "merchant", "customer", "trigger"}
 
@@ -256,7 +256,37 @@ def _catalog_offer(category: dict[str, Any], keywords: list[str] | None = None) 
         for title in titles:
             if any(word in title.lower() for word in lowered):
                 return title
-    return titles[0] if titles else ""
+    # Prefer a concrete service/price over a flat percentage discount.
+    priced = [title for title in titles if "₹" in title and not re.search(r"\bflat\b|%", title, re.I)]
+    return (priced or titles)[0] if titles else ""
+
+
+def _event_offer(merchant: dict[str, Any], event_time: Any) -> str:
+    """Do not promote a weekday-only offer on a different match day."""
+    try:
+        event = datetime.fromisoformat(_clean(event_time).replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    days = {name: index for index, name in enumerate(("mon", "tue", "wed", "thu", "fri", "sat", "sun"))}
+    for offer in _active_offers(merchant):
+        title = _clean(offer.get("title"))
+        bounds = re.search(r"\b(mon|tue|wed|thu|fri|sat|sun)[a-z]*\s*[-–]\s*(mon|tue|wed|thu|fri|sat|sun)[a-z]*", title, re.I)
+        if bounds:
+            start, end = (days[bounds[i].lower()] for i in (1, 2))
+            permitted = {(start + offset) % 7 for offset in range((end - start) % 7 + 1)}
+            if event.weekday() not in permitted:
+                continue
+        elif re.search(r"\bweekday", title, re.I) and event.weekday() >= 5:
+            continue
+        elif re.search(r"\bweekend", title, re.I) and event.weekday() < 5:
+            continue
+        return title
+    return ""
+
+
+def _slot_label(slot: dict[str, Any]) -> str:
+    # Prefer the ISO date when a human label has an inconsistent weekday.
+    return _date_label(slot.get("iso"), include_time=True) if slot.get("iso") else _clean(slot.get("label"))
 
 
 def _merchant_name(merchant: dict[str, Any]) -> str:
@@ -437,6 +467,8 @@ def _digest_item(category: dict[str, Any], trigger: dict[str, Any]) -> dict[str,
         for item in digest:
             if item.get("id") == target:
                 return item
+        # A named but missing source is not interchangeable with another item.
+        return {}
 
     preferred_kind = {
         "research_digest": "research",
@@ -446,7 +478,7 @@ def _digest_item(category: dict[str, Any], trigger: dict[str, Any]) -> dict[str,
     }.get(trigger.get("kind"))
     matching = [item for item in digest if item.get("kind") == preferred_kind]
     # New category versions commonly append fresh items; prefer the latest match.
-    return (matching or digest)[-1] if (matching or digest) else {}
+    return matching[-1] if matching else {}
 
 
 def _strongest_delta(merchant: dict[str, Any], direction: Literal["up", "down"]) -> tuple[str, float] | None:
@@ -536,7 +568,16 @@ def _finalize(text: str, category: dict[str, Any] | None = None) -> str:
     text = re.sub(r"\s+([.,;!?])", r"\1", text)
     text = re.sub(r"([.,;])\1+", r"\1", text)
     text = re.sub(r"\s+—\s+—\s+", " — ", text)
-    return _sentence_case(_clean(text))[:900]
+    text = _sentence_case(_clean(text))
+    if len(text) <= 900:
+        return text
+    # Keep the closing action intact when injected source material is long.
+    closing = re.split(r"(?<=[.!?])\s+", text)[-1]
+    if len(closing) > 250:
+        closing = ""
+    budget = 897 - len(closing)
+    head = text[:budget].rsplit(" ", 1)[0].rstrip(".,;: ")
+    return f"{head}… {closing}".strip()
 
 
 # ---------------------------------------------------------------------------
@@ -571,34 +612,24 @@ def _merchant_message(
     if kind == "research_digest":
         item = _digest_item(category, trigger)
         source = _clean(item.get("source"))
-        title = _clean(item.get("title"))
-        summary = _clean(item.get("summary"))
+        summary = _clean(item.get("summary") or item.get("title"))
         trial_n = _int(item.get("trial_n"))
         cohort = _signal_phrase(merchant, voice, prefer=("high_risk_adult_cohort",))
-        study = voice.t(
-            f" Sample size was {trial_n:,}." if trial_n else "",
-            f" Study mein {trial_n:,} log the." if trial_n else "",
-        )
-        relevance = f" {cohort[0].upper()}{cohort[1:]}." if cohort else ""
-        if title:
+        study = f" (n={trial_n:,})" if trial_n else ""
+        if summary:
             body = voice.t(
-                f"{sal}, worth two minutes — {source or 'this week’s reading'}: {title}. {summary}{study}{relevance} "
-                f"Your {locality} profile is at {perf_line}, so a credible post on this reaches a real audience. "
-                f"Want me to draft one plain-language customer note plus a matching profile post? {ask_yes}",
-                f"{sal}, do minute ki cheez hai — {source or 'is hafte ka reading'}: {title}. {summary}{study}{relevance} "
-                f"Aapki {locality} profile pe {perf_line} hai, toh is par ek credible post asli audience tak jaata hai. "
-                f"Main ek simple customer note aur ek matching profile post draft kar doon? {ask_yes}",
+                f"{sal}, {source or 'the supplied professional update'}{study}: {summary} "
+                f"{cohort + '. ' if cohort else ''}Want a short team briefing on the finding and its limits? {ask_yes}",
+                f"{sal}, {source or 'professional update'}{study}: {summary} "
+                f"{cohort + '. ' if cohort else ''}Finding aur uski limits par team ke liye short note bana doon? {ask_yes}",
             )
         else:
             body = voice.t(
-                f"{sal}, a fresh professional update landed for {slug or 'your category'}. "
-                f"Before it turns into a post: your {locality} profile is at {perf_line}. "
-                f"Want me to pull the one finding that actually applies to your practice and draft a short customer note? {ask_yes}",
-                f"{sal}, {slug or 'aapki category'} ke liye ek nayi professional update aayi hai. "
-                f"Post banane se pehle: aapki {locality} profile pe {perf_line} hai. "
-                f"Main sirf woh ek finding nikaal doon jo aapke kaam ki hai, aur ek chhota customer note draft kar doon? {ask_yes}",
+                f"{sal}, the requested reading is missing from the record for your {locality} practice. Share the title or abstract and I will prepare a source-based summary.",
+                f"{sal}, aapki {locality} practice ke liye requested reading record mein nahi hai. Title ya abstract bhejiye, main uska summary bana dungi.",
             )
-        rationale = "Cited professional reading, tied to a visible cohort signal and the merchant's own profile numbers, with one low-effort drafting CTA."
+            cta = "open_ended"
+        rationale = "Names the exact supplied reading, study limits and cohort relevance without inventing a missing source."
 
     elif kind == "regulation_change":
         item = _digest_item(category, trigger)
@@ -609,20 +640,20 @@ def _merchant_message(
         if action and action[-1] not in ".!?":
             action += "."
         checklist = _cat(slug, {
-            "dentists": ("a 5-point audit checklist plus a one-line note your front desk can repeat",
-                         "5-point audit checklist aur ek line jo aapka front desk bol sake"),
-            "pharmacies": ("a 5-point counter checklist plus a customer-safe explanation",
-                           "5-point counter checklist aur ek customer-safe explanation"),
-        }, ("a 5-point checklist plus a short customer-safe note",
-            "5-point checklist aur ek chhota customer-safe note"))
+            "dentists": ("an audit checklist for your team",
+                         "team ke liye audit checklist"),
+            "pharmacies": ("a counter checklist",
+                           "counter checklist"),
+        }, ("a checklist for your team",
+            "team ke liye checklist"))
         body = voice.t(
             f"{sal}, compliance heads-up from {source}: {summary}"
             f"{f' It takes effect {deadline}.' if deadline else ''}{f' {action}' if action else ''} "
-            f"Your {locality} listing pulls {perf_line}, so patients will ask about it before you announce anything. "
+            f"For your {locality} practice, keep the equipment check and front-desk explanation consistent. "
             f"Want {checklist[0]}? {ask_yes}",
             f"{sal}, {source} se ek compliance update: {summary}"
             f"{f' Yeh {deadline} se effective hai.' if deadline else ''}{f' {action}' if action else ''} "
-            f"Aapki {locality} listing par {perf_line} hai, toh announce karne se pehle hi patients poochhenge. "
+            f"Aapki {locality} practice mein equipment check aur front-desk explanation consistent rakhein. "
             f"Main {checklist[1]} bana doon? {ask_yes}",
         )
         rationale = "Source-cited regulation with the exact effective date, connected to the merchant's own listing traffic, resolved by one compliance artifact."
@@ -642,54 +673,22 @@ def _merchant_message(
             f"{sal}, there is a session worth blocking time for — {title}"
             f"{f' on {event_date}' if event_date else ''}"
             f"{f', {credits} CDE credits' if credits else ''}{f', {fee}' if fee else ''}"
-            f"{f'. Listed by {source}' if source else ''}. Seats on these usually go before the reminder does. "
+            f"{f'. Listed by {source}' if source else ''}. "
             f"Want the registration steps and a calendar block in one message, so it does not slip past clinic hours? {ask_yes}",
             f"{sal}, ek session hai jiske liye time block karna banta hai — {title}"
             f"{f', {event_date} ko' if event_date else ''}"
             f"{f', {credits} CDE credits' if credits else ''}{f', {fee}' if fee else ''}"
-            f"{f'. {source} ne list kiya hai' if source else ''}. Aise sessions ki seats reminder se pehle bhar jaati hain. "
+            f"{f'. {source} ne list kiya hai' if source else ''}. "
             f"Main registration ke steps aur ek calendar block ek hi message mein bhej doon, taaki clinic hours mein miss na ho? {ask_yes}",
         )
-        rationale = "Time-bound professional opportunity with date, credits, fee and source, plus a scarcity reason and a single scheduling action."
+        rationale = "Time-bound professional opportunity with date, credits, fee and source, without inventing seat scarcity and a single scheduling action."
 
     elif kind == "active_planning_intent":
-        topic = _humanize(payload.get("intent_topic"))
-        last_message = _clean(payload.get("merchant_last_message"))
-        plan = _cat(slug, {
-            "restaurants": (
-                f"keep {offer or _catalog_offer(category, ['thali', 'lunch'])} as the base price, then ask for headcount, "
-                "veg/Jain split, delivery window and GST invoice details in one message",
-                f"base price {offer or _catalog_offer(category, ['thali', 'lunch'])} rakhiye, phir ek hi message mein headcount, "
-                "veg/Jain split, delivery window aur GST invoice details maang lijiye",
-            ),
-            "gyms": (
-                f"{offer or _catalog_offer(category, ['trial', 'first month'])} as the entry point, a fixed weekday slot, "
-                "and a 4-week block so people can commit to something finite",
-                f"entry point {offer or _catalog_offer(category, ['trial', 'first month'])} rakhiye, ek fixed weekday slot, "
-                "aur 4-week block taaki log ek finite cheez pe commit kar sakein",
-            ),
-            "salons": (
-                f"lead with {offer or _catalog_offer(category)} and hold two named slots so it reads as a booking, not an ad",
-                f"{offer or _catalog_offer(category)} se lead kijiye aur do named slots hold rakhiye, taaki woh ad nahi booking lage",
-            ),
-        }, (
-            f"anchor it on {offer or _catalog_offer(category) or 'one service at one price'} and put the next step in a single line",
-            f"{offer or _catalog_offer(category) or 'ek service ek price'} pe anchor kijiye aur next step ek line mein rakhiye",
-        ))
-        opener = voice.t(
-            f"picking up your last message — “{last_message}”" if last_message else f"picking up the {topic} plan",
-            f"aapke last message se aage — “{last_message}”" if last_message else f"{topic} wale plan se aage",
-        )
-        body = voice.t(
-            f"{sal}, {opener}. Here is the concrete version for {name}: {plan[0]}. "
-            f"Your listing is at {perf_line}, so this goes out to an audience that already exists. "
-            f"Reply CONFIRM and I will format the ready-to-send copy, or EDIT with the one thing you want changed.",
-            f"{sal}, {opener}. {name} ke liye concrete version yeh hai: {plan[1]}. "
-            f"Aapki listing pe {perf_line} hai, toh yeh already maujood audience tak jaata hai. "
-            f"CONFIRM bhejiye, main ready-to-send copy format kar deti hoon — ya EDIT ke saath ek badlaav bata dijiye.",
-        )
-        cta = "binary_confirm_edit"
-        rationale = "The merchant already committed, so the message skips qualification, quotes their own words back, and delivers a concrete package."
+        body = f"{sal}, {_planning_draft(category, merchant, trigger, voice)}"
+        body += voice.t(" Reply with the one detail to change, or APPROVE to keep this draft.",
+                        " Ek detail badalni ho toh bhejiye, ya draft theek ho toh APPROVE likhiye.")
+        cta = "binary_approve_edit"
+        rationale = "Existing planning intent gets actual proposed copy; package prices and capacity are not inferred from unrelated listing offers."
 
     elif kind in {"perf_dip", "seasonal_perf_dip"}:
         metric = _humanize(payload.get("metric"))
@@ -728,14 +727,14 @@ def _merchant_message(
             # conv_line already carries the numbers; repeating them reads robotic.
             position = "" if conv_line else voice.t(f"Right now — {perf_line}.", f"Abhi — {perf_line}.")
         context_line = voice.t(
-            f" This is the expected seasonal lull ({season_note}), not customers leaving." if seasonal else "",
-            f" Yeh expected seasonal lull hai ({season_note}), customers ja nahi rahe." if seasonal else "",
+            f" The record flags an expected seasonal lull ({season_note}); that alone does not establish the cause." if seasonal else "",
+            f" Record mein expected seasonal lull ({season_note}) flagged hai; isse akela cause confirm nahi hota." if seasonal else "",
         )
         body = voice.t(
             f"{sal}, {lead}. {position}{context_line} "
-            f"The one move that changes this fastest: {fix[0]}. Want me to draft it from your current numbers? {ask_yes}",
+            f"One practical next step: {fix[0]}. Want me to draft it from your current numbers? {ask_yes}",
             f"{sal}, {lead}. {position}{context_line} "
-            f"Sabse tez farak isse aayega: {fix[1]}. Main aapke current numbers se woh draft kar doon? {ask_yes}",
+            f"Ek practical agla step: {fix[1]}. Main aapke current numbers se woh draft kar doon? {ask_yes}",
         )
         rationale = "Names the exact weak metric with its real value, separates seasonality from decline, and offers one category-correct recovery action."
 
@@ -764,14 +763,14 @@ def _merchant_message(
             f" Abhi — {perf_line}." if (delta is not None or not conv_line) else "",
         )
         body = voice.t(
-            f"{sal}, {lead}.{spike_position} Attention like this fades in about a week, "
-            f"and the cheapest way to hold it is to post the same thing again while people are still looking. "
+            f"{sal}, {lead}.{spike_position} Use this rise to test a follow-up post, "
+            f"then compare calls over the next seven days before deciding whether to repeat it. "
             f"Want me to draft that follow-up post around {offer or _catalog_offer(category) or 'your strongest service'}? {ask_yes}",
-            f"{sal}, {lead}.{spike_position} Aisa attention hafte bhar mein thanda pad jaata hai, "
-            f"aur sabse sasta tarika hai wahi cheez dobara post karna jab log abhi dekh rahe hain. "
+            f"{sal}, {lead}.{spike_position} Is rise par ek follow-up post test kijiye, "
+            f"phir agle saat din calls compare karke decide kijiye ki repeat karna hai ya nahi. "
             f"Main {offer or _catalog_offer(category) or 'aapki strongest service'} ke around woh follow-up post draft kar doon? {ask_yes}",
         )
-        rationale = "Positive movement stated with its real magnitude, a time-decay reason to act now, and one repeatable next post."
+        rationale = "Positive movement stated with its real magnitude, a measurable follow-up experiment, and one repeatable next post."
 
     elif kind == "category_seasonal":
         trends = [_humanize(item) for item in payload.get("trends", []) or []]
@@ -812,9 +811,9 @@ def _merchant_message(
                 f"{f', {their_offer} ke saath' if their_offer else ''}",
             )
             body = voice.t(
-                f"{sal}, {fact}. Before reacting: {base}. I would not cut price — that is the one move you cannot undo. "
+                f"{sal}, {fact}. Before reacting: {base}. Before changing price, compare the services included and your costs. "
                 f"Want a sharper listing comparison built on what you actually do better? {ask_yes}",
-                f"{sal}, {fact}. React karne se pehle: {base}. Main price kaatne ko nahi kahungi — woh ek move wapas nahi hota. "
+                f"{sal}, {fact}. React karne se pehle: {base}. Price badalne se pehle included services aur apne costs compare kijiye. "
                 f"Main ek sharper listing comparison bana doon, aapki asli strength par? {ask_yes}",
             )
         else:
@@ -878,8 +877,8 @@ def _merchant_message(
         if offer:
             # An offer already exists; the gap is exposure, not the offer itself.
             move = voice.t(
-                f"one fresh post built on {offer}, which is already live and getting no attention",
-                f"{offer} par ek naya post — woh already live hai par uspe koi dhyaan nahi jaa raha",
+                f"one fresh post built on {offer}, using the price already on your listing",
+                f"{offer} par ek naya post — price aapki listing par already live hai",
             )
         else:
             proposal = _catalog_offer(category)
@@ -889,11 +888,11 @@ def _merchant_message(
             )
         body = voice.t(
             f"{sal}, {gap}{topic_line}.{since_text} Right now the listing sits at {perf_line}. "
-            f"I am not going to send you a plan; the single fastest fix is {move}. "
-            f"Want me to set that up and draft the post today? {ask_yes}",
+            f"One useful restart is {move}. "
+            f"Want the post copy ready to review today? {ask_yes}",
             f"{sal}, {gap}{topic_line}.{since_text} Abhi listing par {perf_line} hai. "
-            f"Main aapko poora plan nahi bhej rahi — sabse tez fix hai {move}. "
-            f"Main aaj hi woh set up karke post draft kar doon? {ask_yes}",
+            f"Dobara shuru karne ke liye ek kaam ki cheez hai {move}. "
+            f"Main aaj hi review ke liye post copy draft kar doon? {ask_yes}",
         )
         rationale = "Dormancy quantified with the exact gap and its measurable cost, narrowed to a single reversible action instead of a menu of options."
 
@@ -902,18 +901,27 @@ def _merchant_message(
         festival_date = _date_label(payload.get("date"))
         days = _int(payload.get("days_until"))
         proposal = offer or _catalog_offer(category)
-        if days is not None and days > 45:
+        if not festival and not festival_date and days is None:
+            body = voice.t(
+                f"{sal}, which upcoming occasion matters for your {locality} customers? Your listing has {perf_line}. "
+                "Send the occasion and date; I will draft one relevant post around your existing services.",
+                f"{sal}, aapke {locality} customers ke liye kaunsa upcoming occasion relevant hai? Listing par {perf_line} hai. "
+                "Occasion aur date bhejiye; existing services par ek relevant post draft kar dungi.",
+            )
+            cta = "open_ended"
+            rationale = "Missing seasonal details are requested instead of inventing a festival or imminent deadline."
+        elif days is not None and days > 45:
             body = voice.t(
                 f"{sal}, {festival or 'the next festival'}{f' is on {festival_date}' if festival_date else ''} — {days} days out. "
-                f"A customer promo today would just be ignored, so I am not going to send one. "
+                f"That leaves time to prepare a concept before choosing a promotion date. "
                 f"What is worth doing now: your listing is at {perf_line}"
                 f"{f' with {offer} live' if offer else ', with no active offer on it'}, and that is what the festive package should be built on. "
-                f"Want me to lock three service+price concepts now and schedule the first post two weeks before {festival or 'the date'}? {ask_yes}",
+                f"Want me to draft one service+price concept to review two weeks before {festival or 'the date'}? {ask_yes}",
                 f"{sal}, {festival or 'agla festival'}{f' {festival_date} ko hai' if festival_date else ''} — {days} din baaki hain. "
-                f"Aaj customer promo bhejna bekaar hai, isliye main bhej nahi rahi. "
+                f"Abhi concept prepare kar sakte hain aur promotion ki date baad mein decide kar sakte hain. "
                 f"Abhi karne layak cheez: aapki listing par {perf_line} hai"
                 f"{f', aur {offer} live hai' if offer else ', aur koi active offer nahi hai'} — festive package isi par banega. "
-                f"Main abhi teen service+price concepts lock kar doon aur pehla post {festival or 'date'} se do hafte pehle schedule kar doon? {ask_yes}",
+                f"Main ek service+price concept draft kar doon, {festival or 'date'} se do hafte pehle review ke liye? {ask_yes}",
             )
             rationale = "Correctly refuses to promote 6 months early, states why, and converts a low-urgency moment into concrete preparation anchored on real listing data."
         else:
@@ -941,38 +949,33 @@ def _merchant_message(
         body = voice.t(
             f"{sal}, {name} is still unverified on Google. Unverified, the listing is already pulling {perf_line} — "
             f"that is demand you are getting without the badge. Estimated gain after verification: "
-            f"{uplift or 'a meaningful lift'} more visibility{f', via {path}' if path else ''}. It is roughly ten minutes of your time. "
+            f"{uplift or 'a meaningful lift'} more visibility{f', via {path}' if path else ''}. That is an estimate, not a guaranteed gain; Google determines the verification method and timing. "
             f"Want the exact three steps in one message? {ask_yes}",
             f"{sal}, {name} abhi tak Google par unverified hai. Unverified hote hue bhi listing par {perf_line} hai — "
             f"yaani demand badge ke bina bhi aa rahi hai. Verify karne ke baad estimate: "
-            f"{uplift or 'achha khaasa'} zyada visibility{f', {path} se' if path else ''}. Aapke das minute lagenge. "
+            f"{uplift or 'achha khaasa'} zyada visibility{f', {path} se' if path else ''}. Yeh estimate hai, pakka gain nahi; verification method aur timing Google decide karta hai. "
             f"Main teen exact steps ek message mein bhej doon? {ask_yes}",
         )
         rationale = "Quantified listing gap with the supplied uplift estimate and verification route, framed as a small effort against demand the merchant is already earning."
 
     elif kind == "ipl_match_today":
-        match = _clean(payload.get("match"))
-        venue = _clean(payload.get("venue"))
-        match_time = _clean(payload.get("match_time_iso"))
-        if match_time:
-            parsed = _date_label(match_time, include_time=True)
-            # The match is today, so only the start time carries information.
-            match_time = parsed.split(", ", 1)[-1] if ", " in parsed else parsed
-        weeknight = payload.get("is_weeknight")
-        offer_text = offer or _catalog_offer(category)
-        body = voice.t(
-            f"{sal}, {match or 'tonight’s match'}{f' starts at {match_time} tonight' if match_time else ' is tonight'}"
-            f"{f' at {venue}' if venue else ''}. On match nights the constraint is kitchen timing, not demand — "
-            f"{'a weekend crowd orders later' if weeknight is False else 'people order in one narrow window'}. "
-            f"{f'{offer_text} is what to lead with' if offer else f'There is no active offer on the listing; {offer_text} is the one to put up'}, "
-            f"with a hard order cutoff on the post. Your listing is at {perf_line}. Want the match-night post with the cutoff line? {ask_yes}",
-            f"{sal}, {match or 'aaj ka match'}{f' aaj raat {match_time} shuru hai' if match_time else ' aaj raat hai'}"
-            f"{f', {venue} par' if venue else ''}. Match nights par dikkat demand ki nahi, kitchen timing ki hoti hai — "
-            f"{'weekend crowd der se order karti hai' if weeknight is False else 'log ek hi narrow window mein order karte hain'}. "
-            f"{f'{offer_text} se lead kijiye' if offer else f'Listing par koi active offer nahi hai; {offer_text} lagana chahiye'}, "
-            f"aur post par ek hard order cutoff. Aapki listing par {perf_line} hai. Cutoff line ke saath match-night post bana doon? {ask_yes}",
+        match = _clean(payload.get("match")) or "the match"
+        timing = _date_label(payload.get("match_time_iso"), include_time=True)
+        valid_offer = _event_offer(merchant, payload.get("match_time_iso"))
+        offer_note = voice.t(
+            f"Use the active offer {valid_offer}." if valid_offer else "Check a match-day menu price; the record does not establish an offer valid for this match.",
+            f"Active offer {valid_offer} use kar sakte hain." if valid_offer else "Match-day menu price check kijiye; record mein is match ke liye valid offer confirm nahi hai.",
         )
-        rationale = "Same-day local event with venue and start time, an operational insight rather than a discount reflex, and one publishable asset."
+        body = voice.t(
+            f"{sal}, {match}{f' — {timing}' if timing else ''}. {offer_note} "
+            f"Your listing has {perf_line}. A useful post can state the menu, delivery area and your confirmed order cutoff. "
+            f"Send the cutoff time and I will draft the post around it.",
+            f"{sal}, {match}{f' — {timing}' if timing else ''}. {offer_note} "
+            f"Aapki listing par {perf_line} hai. Post mein menu, delivery area aur aapka confirmed order cutoff rakhein. "
+            f"Cutoff time bhejiye, uske hisaab se post draft kar dungi.",
+        )
+        cta = "open_ended"
+        rationale = "Uses the actual match date and checks weekday offer restrictions; requests only the missing operational cutoff."
 
     elif kind == "milestone_reached":
         metric = _metric_noun(payload.get("metric"), voice)
@@ -991,18 +994,18 @@ def _merchant_message(
                 f"aap {now_value:,} {metric or ''} par hain — {goal:,} se sirf {gap} door",
             )
             close = voice.t(
-                f"Closing {gap} is a two-day job if you ask the people already walking out happy, not a campaign",
-                f"{gap} ka gap do din ka kaam hai agar aap wahi log poochh lein jo khush hokar nikal rahe hain — campaign ki zarurat nahi",
+                f"Ask for honest feedback after completed visits; there is no need to discount or reward reviews",
+                f"Completed visits ke baad honest feedback maangiye; review ke liye discount ya reward ki zarurat nahi",
             )
             rationale = "Exact distance to the milestone converted into a same-week, zero-budget action assigned to a specific person."
         else:
             lead = voice.t(
-                f"the listing just crossed a real mark — {perf_line}",
-                f"listing ne abhi ek asli mark cross kiya hai — {perf_line}",
+                f"your latest listing snapshot is {perf_line}; the exact milestone is not specified",
+                f"latest listing snapshot: {perf_line}; exact milestone specified nahi hai",
             )
             close = voice.t(
-                "This is the cheapest week of the month to ask for reviews, because the proof is already visible",
-                "Review maangne ke liye mahine ka sabse sasta hafta yahi hai, kyunki proof already dikh raha hai",
+                "A short, neutral review request can make feedback easier after completed visits",
+                "Completed visits ke baad chhota, neutral review request feedback dena asaan bana sakta hai",
             )
             rationale = "A visible performance mark used as the reason to ask for reviews this week, with the ask handed to a named person and no budget attached."
         body = voice.t(
@@ -1085,7 +1088,10 @@ def _merchant_message(
         )
         rationale = "Unknown trigger kind handled with only the facts supplied plus current listing performance, so nothing is invented."
 
-    body = _ensure_anchor(body, merchant, voice)
+    if kind in {"research_digest", "regulation_change", "cde_opportunity", "supply_alert", "active_planning_intent"} and locality and locality not in body:
+        body = body.replace(f"{sal},", f"{sal} ({locality}),", 1)
+    else:
+        body = _ensure_anchor(body, merchant, voice)
     return body, cta, rationale
 
 
@@ -1116,6 +1122,9 @@ def _customer_message(
     prefix = _customer_prefix(customer, merchant, voice)
     merchant_name = _merchant_name(merchant)
     offer = _best_offer(merchant)
+    existing_customer = (_int(_get(customer, "relationship", "visits_total")) or 0) > 0
+    if existing_customer and any(item.get("title") == offer and item.get("audience") == "new_user" for item in category.get("offer_catalog", [])):
+        offer = ""
     body = ""
     cta = "binary_yes_stop"
     rationale = ""
@@ -1128,8 +1137,8 @@ def _customer_message(
             f"Kal aapki appointment hai{f' — {timing}' if timing else ''}.",
         )
         body = voice.t(
-            f"{prefix} {when} Reply CONFIRM to keep it, or RESCHEDULE and we will move you to the next open slot.",
-            f"{prefix} {when} CONFIRM bhejiye toh slot pakka, ya RESCHEDULE likhiye — hum agla khaali slot de denge.",
+            f"{prefix} {when} Reply CONFIRM if you can attend, or RESCHEDULE to check another time.",
+            f"{prefix} {when} Aa sakte hain toh CONFIRM bhejiye, ya doosra time check karne ke liye RESCHEDULE likhiye.",
         )
         cta = "binary_confirm_reschedule"
         rationale = "Next-day reminder sent on behalf of the merchant, with no invented time when the schedule is not supplied, and one two-way CTA."
@@ -1138,7 +1147,7 @@ def _customer_message(
         last_date = _date_label(payload.get("last_service_date"))
         due_date = _date_label(payload.get("due_date"))
         service = _humanize(payload.get("service_due"))
-        slots = [_clean(slot.get("label")) for slot in payload.get("available_slots", []) or [] if isinstance(slot, dict)]
+        slots = [_slot_label(slot) for slot in payload.get("available_slots", []) or [] if isinstance(slot, dict)]
         lead = voice.t(
             f"Your {service or 'next check-in'} is due{f' on {due_date}' if due_date else ''}"
             f"{f'; your last visit was {last_date}' if last_date else ''}.",
@@ -1148,8 +1157,8 @@ def _customer_message(
         if slots:
             listed = _compact_list(slots[:2], conjunction=voice.t("or", "ya"))
             body = voice.t(
-                f"{prefix} {lead} Two slots are open: {listed}. Reply 1 or 2 and we will hold it, or RESCHEDULE for another time.",
-                f"{prefix} {lead} Do slot khaali hain: {listed}. 1 ya 2 reply kijiye, hum hold kar lenge — ya RESCHEDULE likhiye.",
+                f"{prefix} Listed availability: {listed}. Reply with your preferred time; the clinic will confirm the booking.",
+                f"{prefix} {lead} Listed availability: {listed}. Preferred time reply kijiye; clinic booking confirm karega.",
             )
             cta = "multi_choice_slot"
         else:
@@ -1164,8 +1173,8 @@ def _customer_message(
         if slug != "pharmacies":
             # The trigger label does not fit this category; never invent medicines.
             body = voice.t(
-                f"{prefix} Your follow-up is due. Reply YES and we will send you this week's open slots, or STOP if you would rather not be reminded.",
-                f"{prefix} Aapka follow-up due hai. YES bhejiye, hum is hafte ke khaali slots bhej denge — ya STOP likhiye toh reminder band.",
+                f"{prefix} Checking whether you need a follow-up visit. Reply YES to check availability, or STOP to end reminders.",
+                f"{prefix} Follow-up visit chahiye? Availability check karne ke liye YES bhejiye, ya reminder band karne ke liye STOP.",
             )
             rationale = "The refill label is inconsistent with a non-pharmacy merchant, so the message degrades to a safe follow-up reminder and names no medicine."
         else:
@@ -1197,7 +1206,7 @@ def _customer_message(
     elif kind in {"customer_lapsed_hard", "customer_lapsed_soft"}:
         days = _int(payload.get("days_since_last_visit"))
         focus = _humanize(payload.get("previous_focus"))
-        proposal = offer or _catalog_offer(category, ["trial", "consult", "free", "first"])
+        proposal = offer
         gap = voice.t(
             f"It has been about {max(1, round(days / 7))} weeks since your last visit." if days else "It has been a while since your last visit.",
             f"Aapki last visit ko takreeban {max(1, round(days / 7))} hafte ho gaye." if days else "Aapki last visit ko kaafi time ho gaya.",
@@ -1215,23 +1224,29 @@ def _customer_message(
         body = voice.t(
             f"{prefix} {gap} {easy[0]}{focus_line}"
             f"{f' {proposal} is available if you want an easy way back in.' if proposal else ''} "
-            f"Reply YES and we will hold one slot for you this week, or STOP and we will not message again.",
+            f"Reply YES to check availability this week, or STOP and we will not message again.",
             f"{prefix} {gap} {easy[1]}{focus_line}"
             f"{f' Wapas aane ka asaan tareeka — {proposal}.' if proposal else ''} "
-            f"YES bhejiye, hum is hafte ek slot hold kar lenge — ya STOP likhiye, phir message nahi aayega.",
+            f"YES bhejiye, is hafte ki availability check karenge — ya STOP likhiye, phir message nahi aayega.",
         )
+        if slug == "pharmacies":
+            body = voice.t(
+                f"{prefix} {gap} Need to check availability for a product? Reply with its name; prescription medicines require a valid prescription. Reply STOP to end these messages.",
+                f"{prefix} {gap} Kisi product ki availability check karni hai? Naam bhejiye; prescription medicines ke liye valid prescription chahiye. Messages band karne ke liye STOP likhiye.",
+            )
+            cta = "open_ended"
         rationale = "No-shame win-back with the supplied gap and prior goal, a low-commitment entry offer, and an explicit permanent opt-out."
 
     elif kind == "trial_followup":
         trial_date = _date_label(payload.get("trial_date"))
-        slots = [_clean(slot.get("label")) for slot in payload.get("next_session_options", []) or [] if isinstance(slot, dict)]
+        slots = [_slot_label(slot) for slot in payload.get("next_session_options", []) or [] if isinstance(slot, dict)]
         listed = _compact_list(slots[:2], conjunction=voice.t("or", "ya"))
         body = voice.t(
             f"{prefix} Thanks for coming in for the trial{f' on {trial_date}' if trial_date else ''}. "
-            f"{f'Next session: {listed}.' if listed else 'The next session is open whenever you are ready.'} "
+            f"{f'Next session: {listed}.' if listed else 'Message us to check availability for the next session.'} "
             f"Reply YES to hold your place, or ANOTHER if a different time suits you better.",
             f"{prefix} Trial ke liye aane ka shukriya{f' — {trial_date}' if trial_date else ''}. "
-            f"{f'Agla session: {listed}.' if listed else 'Agla session jab aap taiyar hon.'} "
+            f"{f'Agla session: {listed}.' if listed else 'Agla session available hai ya nahi, message karke check kijiye.'} "
             f"YES bhejiye toh jagah hold, ya ANOTHER likhiye agar koi aur time theek rahega.",
         )
         cta = "binary_yes_another"
@@ -1243,10 +1258,10 @@ def _customer_message(
         window = _humanize(payload.get("next_step_window_open"))
         body = voice.t(
             f"{prefix} Your trial was{f' on {trial}' if trial else ' completed'}, and the wedding is{f' on {wedding}' if wedding else ' close now'}. "
-            f"The {window or 'next preparation'} window is open, and this is the stretch when dates fill up first. "
+            f"The {window or 'next preparation'} window is open, so we can discuss the next preparation step. "
             f"Reply YES and we will hold a planning slot for you, or STOP if the plan has changed.",
             f"{prefix} Aapka trial{f' {trial} ko' if trial else ''} ho chuka hai, aur wedding{f' {wedding} ko hai' if wedding else ' paas hai'}. "
-            f"{window or 'Agli tayari'} ka window khul chuka hai, aur isi time mein dates sabse pehle bhar jaati hain. "
+            f"{window or 'Agli tayari'} ka window khul chuka hai, toh agli tayari discuss kar sakte hain. "
             f"YES bhejiye, hum planning slot hold kar lenge — ya plan badal gaya ho toh STOP.",
         )
         rationale = "Bridal timeline stated from the record with a real scarcity reason, and a graceful exit if plans changed."
@@ -1331,6 +1346,7 @@ class StateStore:
         self.conversations: dict[str, dict[str, Any]] = {}
         self.sent_suppression_keys: set[str] = set()
         self.muted_merchants: set[str] = set()
+        self.muted_customers: set[str] = set()
         # Tracked per merchant as well as per conversation: the trap arrives
         # on four different thread ids.
         self.auto_replies: dict[str, Counter] = {}
@@ -1341,6 +1357,7 @@ class StateStore:
             self.conversations.clear()
             self.sent_suppression_keys.clear()
             self.muted_merchants.clear()
+            self.muted_customers.clear()
             self.auto_replies.clear()
 
     def put_context(self, body: ContextBody) -> tuple[bool, int | None]:
@@ -1375,7 +1392,7 @@ class StateStore:
         category = self.payload("category", merchant.get("category_slug")) if merchant else None
         return category, merchant
 
-    def latest_trigger_for(self, merchant_id: str | None) -> dict[str, Any] | None:
+    def latest_trigger_for(self, merchant_id: str | None, customer_id: str | None = None) -> dict[str, Any] | None:
         """Best-effort recovery when a reply arrives on an unknown thread."""
         if not merchant_id:
             return None
@@ -1383,6 +1400,7 @@ class StateStore:
             item["payload"]
             for (scope, _), item in self.contexts.items()
             if scope == "trigger" and _trigger_merchant_id(item["payload"]) == merchant_id
+            and _trigger_customer_id(item["payload"]) == customer_id
         ]
         if not candidates:
             return None
@@ -1446,6 +1464,10 @@ def _trigger_quality(
         try:
             expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
             current = datetime.fromisoformat(now.replace("Z", "+00:00"))
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=timezone.utc)
             if current >= expiry:
                 return False
         except ValueError:
@@ -1481,7 +1503,7 @@ def _conversation_id(trigger: dict[str, Any]) -> str:
 
 
 def _normalise_reply(message: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", message.lower()).strip()
+    return re.sub(r"[^\w]+", " ", message.lower()).strip()
 
 
 AUTO_REPLY_PATTERNS = (
@@ -1499,19 +1521,20 @@ AUTO_REPLY_PATTERNS = (
     r"team tak pahuncha",
 )
 STOP_PATTERNS = (
-    r"\bstop\b", r"unsubscribe", r"do not message", r"don'?t message", r"stop messaging",
+    r"^\s*stop[.! ]*$", r"unsubscribe", r"do not message", r"don'?t message", r"stop messaging",
     r"not interested", r"useless spam", r"\bspam\b", r"leave me alone", r"band karo",
-    r"mat bhejo", r"message mat", r"remove me",
+    r"mat bhejo", r"message mat", r"remove me", r"\b(?:do not|don't) send\b",
 )
 COMMIT_PATTERNS = (
     r"let'?s do it", r"lets do it", r"go ahead", r"\bproceed\b", r"what'?s next", r"whats next",
     r"i want to join", r"mujhe.*judna", r"mujhe.*join", r"kar do", r"kar dijiye", r"\bconfirm\b",
     r"yes please", r"sounds good", r"\bdraft\b", r"\bok(ay)?\b.*\b(next|do it|go)\b",
     r"\b(send|share|pull|show) me\b", r"\bplease (send|share|pull|show)\b", r"\bhaan\b",
+    r"^\s*(approve|approved|publish|post it|send it)[.! ]*$",
 )
 # Narrow on purpose: "no, what's the price?" is not a decline.
 DECLINE_PATTERNS = (
-    r"^\s*no[.! ]*$", r"\bno thanks?\b", r"\bnot now\b", r"\bmaybe later\b", r"\bsome other time\b",
+    r"^\s*no[.! ]*$", r"^\s*no thanks?[.! ]*$", r"^\s*not now[.! ]*$", r"^\s*maybe later[.! ]*$", r"^\s*some other time[.! ]*$",
     r"\bno need\b", r"\bnot required\b", r"\bnot interested\b",
     r"\bnahi chahiye\b", r"\babhi nahi\b", r"\bbaad mein\b", r"\bfilhaal nahi\b", r"\brehne do\b",
 )
@@ -1533,19 +1556,16 @@ def _reply_context(
     is empty; the merchant id on the request is enough to recover.
     """
     state = state if isinstance(state, dict) else {}
-    category = state.get("category")
-    merchant = state.get("merchant")
-    trigger = state.get("trigger")
-
-    if not merchant:
-        stored_category, merchant = STORE.merchant_context(merchant_id)
-        category = category or stored_category
-    if not category and merchant:
-        category = STORE.payload("category", merchant.get("category_slug"))
+    stored_category, stored_merchant = STORE.merchant_context(merchant_id)
+    merchant = stored_merchant or state.get("merchant")
+    category = stored_category or state.get("category")
+    prior_trigger = state.get("trigger") or {}
+    trigger = STORE.payload("trigger", prior_trigger.get("id")) or prior_trigger
+    customer_id = customer_id or _get(state, "customer", "customer_id")
     if not trigger:
-        trigger = STORE.latest_trigger_for(merchant_id or _trigger_merchant_id(merchant or {}))
-    if not state.get("customer") and customer_id:
-        state["customer"] = STORE.payload("customer", customer_id)
+        trigger = STORE.latest_trigger_for(merchant_id, customer_id)
+    if customer_id:
+        state["customer"] = STORE.payload("customer", customer_id) or state.get("customer")
 
     # Cache the resolution so later turns on this thread stay consistent.
     if merchant:
@@ -1557,71 +1577,194 @@ def _reply_context(
     return category, merchant, trigger
 
 
+def _post_draft(category: dict, merchant: dict, voice: Voice) -> str:
+    """Customer copy uses live merchant offers, never a category catalog price."""
+    name, locality = _merchant_name(merchant), _locality(merchant)
+    offer = _best_offer(merchant)
+    location = f", {locality}" if locality else ""
+    close = {
+        "restaurants": ("Message us for the menu and order timing.", "Menu aur order timing ke liye message kijiye."),
+        "pharmacies": ("Message us to check availability; prescription medicines require a valid prescription.", "Availability ke liye message kijiye; prescription medicines ke liye valid prescription zaruri hai."),
+        "dentists": ("Message the clinic for appointment availability and treatment details.", "Appointment availability aur treatment details ke liye clinic ko message kijiye."),
+    }.get(category.get("slug"), ("Message us for details and available timings.", "Details aur available timings ke liye message kijiye."))
+    return f"{name}{location}.{f' {offer}.' if offer else ''} {voice.t(*close)}"
+
+
+def _planning_draft(category: dict, merchant: dict, trigger: dict, voice: Voice) -> str:
+    topic = _humanize(_get(trigger, "payload", "intent_topic"))
+    name = _merchant_name(merchant)
+    if category.get("slug") == "restaurants" and re.search(r"thali|corporate|bulk", topic, re.I):
+        offer = _best_offer(merchant, ["thali", "lunch"])
+        return voice.t(
+            f"Proposed customer message: “Planning an office lunch? {name}{f' lists {offer}' if offer else ' can discuss your lunch requirements'}. Share your headcount, date, veg/Jain requirements and delivery location for a bulk quote.” Confirm capacity and delivery charges before quoting; the listed offer is not a confirmed bulk rate.",
+            f"Customer ke liye draft: “Office lunch plan kar rahe hain? {name}{f' par {offer} listed hai' if offer else ' se lunch requirements discuss kijiye'}. Bulk quote ke liye headcount, date, veg/Jain requirements aur delivery location bhejiye.” Quote se pehle capacity aur delivery charges check kijiye; listed offer ko bulk rate na maanein.",
+        )
+    if category.get("slug") == "gyms" and re.search(r"kids|child|yoga|camp", topic, re.I):
+        return voice.t(
+            f"Proposed pilot: a 4-week kids yoga block, grouped by age, with a parent introduction and an instructor-confirmed capacity. Interest-check draft: “{name} is exploring a kids yoga group. Send your child's age and preferred weekday timing; we will share the proposed schedule and fee.” Confirm the age band, instructor and fee before opening bookings.",
+            f"Pilot ka proposal: 4-week kids yoga block, age ke hisaab se groups, parent introduction aur instructor se capacity confirm. Interest-check draft: “{name} kids yoga group plan kar raha hai. Bachche ki age aur preferred weekday timing bhejiye; proposed schedule aur fee share karenge.” Bookings se pehle age band, instructor aur fee confirm kijiye.",
+        )
+    return voice.t(f"Draft for {topic or 'your next post'}: “{_post_draft(category, merchant, voice)}”",
+                   f"{topic or 'Agle post'} ka draft: “{_post_draft(category, merchant, voice)}”")
+
+
+def _match_draft(merchant: dict, trigger: dict, voice: Voice, cutoff: str = "") -> str:
+    payload = trigger.get("payload") or {}
+    match = _clean(payload.get("match")) or "Match day"
+    timing = _date_label(payload.get("match_time_iso"), include_time=True)
+    offer = _event_offer(merchant, payload.get("match_time_iso"))
+    detail = f"{match}{f' — {timing}' if timing else ''}. {_merchant_name(merchant)}, {_locality(merchant)}."
+    if offer:
+        detail += f" {offer}."
+    if cutoff:
+        detail += voice.t(f" Order by {cutoff}.", f" Order {cutoff} tak kijiye.")
+    detail += voice.t(" Message us for the menu, prices and delivery area.",
+                      " Menu, prices aur delivery area ke liye message kijiye.")
+    return voice.t(f"Match-day draft: “{detail}” Check the details before posting.",
+                   f"Match-day draft: “{detail}” Post karne se pehle details check kijiye.")
+
+
 def _commitment_response(
     category: dict[str, Any] | None,
     merchant: dict[str, Any] | None,
     trigger: dict[str, Any] | None,
     turn_number: int,
+    customer: dict[str, Any] | None = None,
+    voice: Voice | None = None,
 ) -> str:
-    """Answer a commitment with delivery, never with another qualifying question."""
-    merchant = merchant or {}
-    category = category or {}
-    trigger = trigger or {}
-    voice = Voice(category, merchant)
+    """Deliver the requested content in this response, without claiming a send."""
+    merchant, category, trigger = merchant or {}, category or {}, trigger or {}
+    voice = voice or Voice(category, merchant)
     kind = _clean(trigger.get("kind"))
-    merchant_name = _merchant_name(merchant)
-    perf_line = _perf_line(merchant, voice)
-    basis = voice.t(
-        f" It is built on your current numbers — {perf_line}." if perf_line else "",
-        f" Yeh aapke current numbers par bana hai — {perf_line}." if perf_line else "",
-    )
-
+    payload = trigger.get("payload") or {}
+    item = _digest_item(category, trigger)
+    source = _clean(item.get("source"))
+    summary = _clean(item.get("summary") or item.get("title"))
+    action = _clean(item.get("actionable"))
+    if kind == "active_planning_intent":
+        return _planning_draft(category, merchant, trigger, voice)
+    if kind == "ipl_match_today":
+        return _match_draft(merchant, trigger, voice)
     if kind == "research_digest":
-        item = _digest_item(category, trigger)
-        summary = _clean(item.get("summary") or item.get("title"))
-        source = _clean(item.get("source"))
+        if not summary:
+            return voice.t("The requested reading is missing from the supplied record. Share its title or text and I can summarise it accurately.",
+                           "Requested reading record mein nahi hai. Title ya text bhejiye, main uska sahi summary bana dungi.")
         return voice.t(
-            f"Done. Here is the part that matters{f' from {source}' if source else ''}: {summary} "
-            f"I have the patient-friendly draft ready too.{basis} Reply CONFIRM to use it, or EDIT with the one change you want.",
-            f"Ho gaya. Kaam ki baat yeh hai{f' — {source} se' if source else ''}: {summary} "
-            f"Patient-friendly draft bhi ready hai.{basis} CONFIRM bhejiye toh yahi use karein, ya EDIT ke saath ek badlaav bata dijiye.",
+            f"Here is the reading summary{f' — {source}' if source else ''}: {summary} {action} Keep the finding limited to the studied group; it is not an individual treatment recommendation.",
+            f"Yeh raha reading ka summary{f' — {source}' if source else ''}: {summary} {action} Finding sirf study wale group tak rakhein; individual treatment ka decision clinician karein.",
         )
-    if kind in {"regulation_change", "supply_alert"}:
+    if kind == "regulation_change":
+        deadline = _date_label(payload.get("deadline_iso"))
         return voice.t(
-            f"Done — the checklist and the customer-safe note are both drafted and ready to send.{basis} "
-            "Reply CONFIRM to use this version, or EDIT with the one change you want.",
-            f"Ho gaya — checklist aur customer-safe note dono draft ho gaye hain.{basis} "
-            "CONFIRM bhejiye toh yahi version, ya EDIT ke saath ek badlaav bata dijiye.",
+            f"Checklist{f' — {source}' if source else ''}: 1) Check the notice and its applicability{f' before {deadline}' if deadline else ''}. 2) {action or 'Identify which equipment or process is affected.'} 3) Record the check and assign any corrective work. Notice summary: {summary or 'The full notice is not supplied; verify it before changing procedures.'}",
+            f"Checklist{f' — {source}' if source else ''}: 1) Notice aur applicability check kijiye{f', {deadline} se pehle' if deadline else ''}. 2) {action or 'Affected equipment ya process identify kijiye.'} 3) Check record kijiye aur corrective work assign kijiye. Notice summary: {summary or 'Full notice supplied nahi hai; procedure badalne se pehle verify kijiye.'}",
+        )
+    if kind == "supply_alert":
+        batches = _compact_list(payload.get("affected_batches") or [])
+        molecule = _humanize(payload.get("molecule"))
+        return voice.t(
+            f"Here is the checklist: verify the recall notice for {molecule or 'the affected medicine'}{f', batches {batches}' if batches else ''}; isolate only matching stock; record quantities and contact the supplier. Customer note: “Please check your pack's batch number with our pharmacist. If it matches the recall, contact us for the next steps. Consult your prescriber before changing treatment.”",
+            f"Checklist draft: {molecule or 'affected medicine'} ka recall notice verify kijiye{f', batches {batches}' if batches else ''}; matching stock alag rakhiye; quantity record karke supplier ko contact kijiye. Customer note: “Apne pack ka batch number pharmacist se check karaiye. Recall se match ho toh agle steps ke liye contact kijiye. Treatment badalne se pehle prescriber se baat kijiye.”",
         )
     if kind == "cde_opportunity":
+        date = _date_label(item.get("date"), include_time=True)
         return voice.t(
-            "Done — the registration steps and the calendar block are drafted in one message, ready to send. "
-            "Reply CONFIRM to use it, or EDIT with the one change you want.",
-            "Ho gaya — registration ke steps aur calendar block ek hi message mein draft hain, bhejne ke liye ready. "
-            "CONFIRM bhejiye, ya EDIT ke saath ek badlaav bata dijiye.",
+            f"Calendar details: {_clean(item.get('title')) or 'Session title not supplied'}{f' — {date}' if date else ''}. {_clean(item.get('actionable'))} Next: check registration with {source or 'the organiser'} and add the confirmed session to your calendar. No registration link was supplied; no booking has been made.",
+            f"Calendar details: {_clean(item.get('title')) or 'Session title supplied nahi hai'}{f' — {date}' if date else ''}. {_clean(item.get('actionable'))} Agla step: {source or 'organiser'} se registration check karke confirmed session calendar mein add kijiye. Registration link supplied nahi hai; booking nahi hui hai.",
         )
-    if kind in {"appointment_tomorrow", "recall_due", "trial_followup", "chronic_refill_due", "customer_lapsed_hard", "customer_lapsed_soft"}:
+    if kind == "gbp_unverified":
         return voice.t(
-            "Done — the customer message is drafted from the latest record and is ready to send. "
-            "Reply CONFIRM to send it, or CHANGE with the one detail that differs.",
-            "Ho gaya — customer ka message latest record se draft ho gaya hai, bhejne ke liye ready. "
-            "CONFIRM bhejiye toh bhej deti hoon, ya CHANGE likhiye agar koi detail alag hai.",
+            "Here are the steps: 1) Open your business profile while signed into its owner account. 2) Select Get verified and follow the method Google actually offers. 3) Complete the requested verification and check its status there. Available methods and review time depend on Google; never share a verification code here.",
+            "Yeh rahe steps: 1) Owner account se business profile kholiye. 2) Get verified select karke Google jo method dikhaye use follow kijiye. 3) Verification complete karke wahin status check kijiye. Method aur review time Google par depend karte hain; verification code yahan share na karein.",
         )
+    if kind == "renewal_due":
+        amount = payload.get("renewal_amount")
+        return voice.t(
+            f"Renewal check: {_perf_line(merchant, voice)}.{f' Quoted renewal: {_money(amount)}.' if amount is not None else ''} Views and calls measure interest, not paid sales. Completed bookings and attributable revenue are missing, so I cannot calculate ROI. Compare those with the renewal amount before deciding.",
+            f"Renewal check: {_perf_line(merchant, voice)}.{f' Renewal amount: {_money(amount)}.' if amount is not None else ''} Views aur calls interest dikhate hain, paid sales nahi. Completed bookings aur attributable revenue nahi hain, isliye ROI calculate nahi kar sakti. Decide karne se pehle unhe renewal amount se compare kijiye.",
+        )
+    if kind == "review_theme_emerged":
+        theme = _humanize(payload.get("theme")) or "the issue raised"
+        return voice.t(
+            f"Review reply draft: “Thank you for flagging {theme}. We are sorry your visit fell short. Please message us with the visit date so our team can look into what happened.” Next: assign one team member to investigate this issue and record the corrective step before promising a fix publicly.",
+            f"Review reply draft: “{theme} batane ke liye shukriya. Aapka experience achha nahi raha, uska afsos hai. Visit date message kijiye taaki team check kar sake.” Agla step: ek team member ko issue check karne dein; publicly fix promise karne se pehle corrective step record kijiye.",
+        )
+    if kind == "milestone_reached":
+        return voice.t(
+            f"Review request draft: “Thank you for visiting {_merchant_name(merchant)}. Please share an honest review of your experience on our listing; your feedback helps us improve.” Send the same neutral request after completed visits, without rewards or filtering for positive feedback.",
+            f"Review request draft: “{_merchant_name(merchant)} aane ke liye shukriya. Listing par apne experience ka honest review share kijiye; aapke feedback se humein sudhaarne mein madad milti hai.” Completed visits ke baad yahi neutral request bhejein, bina reward ya sirf positive feedback choose kiye.",
+        )
+    if kind == "category_seasonal":
+        trends = _compact_list([_humanize(t) for t in payload.get("trends", [])])
+        return voice.t(
+            f"Shelf checklist{f' for {trends}' if trends else ''}: 1) Compare stock and expiry dates with the listed demand shifts. 2) Check availability with suppliers before reordering. 3) Put verified availability and prices on the counter list. Adjust quantities using your sales records; the demand figures do not specify order quantities.",
+            f"Shelf checklist{f' — {trends}' if trends else ''}: 1) Demand shifts ke saath stock aur expiry dates check kijiye. 2) Reorder se pehle supplier se availability check kijiye. 3) Verified availability aur prices counter list par rakhiye. Quantity sales record se decide kijiye; demand figures order quantity nahi hain.",
+        )
+    if customer and trigger.get("scope") == "customer":
+        draft = _customer_message(category, merchant, trigger, customer)[0]
+    else:
+        draft = _post_draft(category, merchant, voice)
+    return voice.t(f"Here is the copy: “{draft}” Check the details before using it; this is a draft, not a published post.",
+                   f"Yeh raha draft: “{draft}” Use karne se pehle details check kijiye; abhi post publish nahi hua hai.")
 
-    noun = _humanize(kind) or voice.t("requested", "requested")
-    if turn_number > 2:
-        return voice.t(
-            f"Done — the {noun} draft for {merchant_name} is ready.{basis} "
-            "Reply CONFIRM to use this version, or EDIT with the one change you want.",
-            f"Ho gaya — {merchant_name} ke liye {noun} draft ready hai.{basis} "
-            "CONFIRM bhejiye toh yahi version, ya EDIT ke saath ek badlaav bata dijiye.",
-        )
-    return voice.t(
-        f"Done — moving straight to it. The {noun} draft for {merchant_name} is prepared.{basis} "
-        "Next step is yours: reply CONFIRM to use it, or EDIT with the one change you want. No more questions from me.",
-        f"Ho gaya — main seedha kaam par. {merchant_name} ke liye {noun} draft taiyar hai.{basis} "
-        "Ab aapka step: CONFIRM bhejiye toh yahi use karein, ya EDIT ke saath ek badlaav bata dijiye. Aur sawaal nahi.",
-    )
+
+def _reply_voice(category: dict | None, merchant: dict | None, message: str) -> Voice:
+    voice = Voice(category, merchant)
+    if re.search(r"\b(english|angrezi)\b", message, re.I):
+        voice.level = "off"
+    elif re.search(r"[\u0900-\u097f]|\b(hindi|hinglish|haan|bhejo|bhejiye|karo|kijiye|kaise|kitna|nahi)\b", message, re.I):
+        voice.level = "natural"
+    return voice
+
+
+def _question_response(category: dict, merchant: dict, trigger: dict, message: str, voice: Voice) -> str:
+    payload = trigger.get("payload") or {}
+    if re.search(r"\b(price|cost|fee|charge|charges|kitna|kitne|pricing|paid|free)\b", message, re.I):
+        if re.search(r"\b(vera|subscription|renew|renewal)\b|\byour (?:price|cost|fee|charges?|pricing|plan)\b|\byou charge\b", message, re.I) or trigger.get("kind") == "renewal_due":
+            amount = payload.get("renewal_amount")
+            return voice.t(
+                f"The supplied renewal quote is {_money(amount)}. No additional fees are listed." if amount is not None else "Vera's subscription pricing is not supplied here, so I cannot quote a fee. Check the plan price in your merchant account before approving a purchase.",
+                f"Supplied renewal quote {_money(amount)} hai. Additional fees listed nahi hain." if amount is not None else "Vera ki subscription pricing yahan supplied nahi hai, isliye fee quote nahi kar sakti. Purchase approve karne se pehle merchant account mein plan price check kijiye.",
+            )
+        if trigger.get("kind") == "active_planning_intent":
+            return voice.t("The proposed program/package has no confirmed fee yet. Set its price after checking capacity and costs; an existing listing offer does not establish this package's price.",
+                           "Proposed program/package ki fee abhi confirm nahi hai. Capacity aur costs check karke price set kijiye; existing listing offer is package ka confirmed price nahi hai.")
+        offer = _event_offer(merchant, payload.get("match_time_iso")) if trigger.get("kind") == "ipl_match_today" else _best_offer(merchant)
+        return voice.t(f"Your active listing offer is {offer}. Other charges are not specified in the record." if offer else "There is no active priced offer in the supplied listing. Share the service and price you want to use and I can include them in the draft.",
+                       f"Aapka active listing offer {offer} hai. Record mein doosre charges specified nahi hain." if offer else "Supplied listing mein active priced offer nahi hai. Service aur price bhejiye, draft mein add kar dungi.")
+    if re.search(r"\b(source|proof|study|abstract|evidence|checklist|steps|register|registration)\b", message, re.I):
+        return _commitment_response(category, merchant, trigger, 1, voice=voice)
+    if re.search(r"\b(who are you|what is this|what.*about|why|kyun|kya hai)\b", message, re.I):
+        explanation = _merchant_message(category, merchant, trigger)[0]
+        # The original message gives the exact reason and next step for this thread.
+        return explanation
+    return _commitment_response(category, merchant, trigger, 1, voice=voice)
+
+
+def _customer_reply(state: dict, message: str, voice: Voice) -> dict[str, Any]:
+    trigger = state.get("trigger") or {}
+    payload = trigger.get("payload") or {}
+    normalized = _normalise_reply(message)
+    slots = payload.get("available_slots") or payload.get("next_session_options") or []
+    if normalized in {"1", "2"}:
+        index = int(normalized) - 1
+        if index < len(slots):
+            label = _slot_label(slots[index])
+            state["requested_slot"] = label
+            text = voice.t(f"Your requested time is {label}. The team still needs to confirm availability; your booking is not confirmed yet.",
+                           f"Aapne {label} choose kiya hai. Team ko availability confirm karni hai; booking abhi confirm nahi hui hai.")
+        else:
+            text = voice.t("That option is not in the current schedule. Please send your preferred day and time.", "Yeh option current schedule mein nahi hai. Preferred day aur time bhejiye.")
+    elif re.search(r"\b(reschedule|another|change)\b", normalized):
+        text = voice.t("Please send your preferred day and time; the team will need to confirm availability.", "Apna preferred day aur time bhejiye; team ko availability confirm karni hai.")
+        if trigger.get("kind") == "chronic_refill_due":
+            text = voice.t("Please have the pharmacist review the updated prescription before preparing the refill. Do not change your medicines based on this reminder.", "Refill taiyar karne se pehle pharmacist se updated prescription review karaiye. Is reminder ke basis par medicines change na karein.")
+    elif re.search(r"\b(confirm|yes|haan|refill)\b", normalized):
+        state["customer_requested"] = normalized
+        text = voice.t("Your request is noted in this chat. The team needs to confirm the details before a booking or refill is ready.", "Aapki request is chat mein note hai. Booking ya refill ready hone se pehle team ko details confirm karni hain.")
+    else:
+        text = voice.t("Please share the appointment or refill detail you need help with; the team will need to confirm any schedule or prescription change.", "Appointment ya refill ki jis detail mein help chahiye woh bhejiye; schedule ya prescription change team ko confirm karna hai.")
+    return {"action": "send", "body": text, "cta": "open_ended", "rationale": "Customer reply stays in the booking/refill flow and distinguishes a request from a completed transaction."}
 
 
 def _strip_qualifiers(text: str) -> str:
@@ -1723,6 +1866,8 @@ def tick(body: TickBody) -> dict[str, list[dict[str, Any]]]:
                 continue
             customer_id = _trigger_customer_id(trigger)
             customer = STORE.payload("customer", customer_id) if customer_id else None
+            if customer_id in STORE.muted_customers:
+                continue
             if customer and customer.get("merchant_id") not in (None, merchant_id):
                 continue
             suppression_key = _clean(trigger.get("suppression_key")) or f"trigger:{trigger_id}"
@@ -1739,6 +1884,9 @@ def tick(body: TickBody) -> dict[str, list[dict[str, Any]]]:
             merchant_id = _trigger_merchant_id(trigger)
             customer_id = _trigger_customer_id(trigger)
             entity = (merchant_id, customer_id)
+            suppression_key = _clean(trigger.get("suppression_key")) or f"trigger:{trigger_id}"
+            if suppression_key in STORE.sent_suppression_keys:
+                continue
             if entity in selected_entities or len(actions) >= 20:
                 continue
             result = compose(category, merchant, trigger, customer)
@@ -1771,6 +1919,8 @@ def tick(body: TickBody) -> dict[str, list[dict[str, Any]]]:
                 "merchant_id": merchant_id,
                 "turns": [{"from": "bot", "body": result["body"]}],
             }
+            if trigger.get("kind") == "active_planning_intent":
+                STORE.conversations[conversation_id]["delivered"] = result["body"]
     return {"actions": actions}
 
 
@@ -1778,7 +1928,6 @@ def tick(body: TickBody) -> dict[str, list[dict[str, Any]]]:
 def reply(body: ReplyBody) -> dict[str, Any]:
     message = _clean(body.message)
     normalized = _normalise_reply(message)
-
     with STORE.lock:
         state = STORE.conversations.setdefault(body.conversation_id, {"turns": []})
         state.setdefault("turns", []).append({"from": body.from_role, "body": message})
@@ -1786,129 +1935,128 @@ def reply(body: ReplyBody) -> dict[str, Any]:
         if merchant_id:
             state["merchant_id"] = merchant_id
         category, merchant, trigger = _reply_context(state, merchant_id, body.customer_id)
-        voice = Voice(category, merchant)
+        category, merchant, trigger = category or {}, merchant or {}, trigger or {}
+        customer = state.get("customer")
+        customer_id = body.customer_id or _get(customer, "customer_id")
+        is_customer = body.from_role == "customer"
+        voice = _customer_voice(category, merchant, customer) if is_customer else _reply_voice(category, merchant, message)
 
-        # 1. Hostility and opt-out win, answered with an apology.
+        def send(text: str, rationale: str, cta: str = "open_ended") -> dict[str, Any]:
+            rendered = _finalize(text, category)
+            state["turns"].append({"from": "bot", "body": rendered})
+            return {"action": "send", "body": rendered, "cta": cta, "rationale": rationale}
+
         if _matches_any(message, STOP_PATTERNS):
-            if merchant_id:
+            if is_customer and customer_id:
+                STORE.muted_customers.add(customer_id)
+            elif not is_customer and merchant_id:
                 STORE.muted_merchants.add(merchant_id)
                 STORE.auto_replies.pop(merchant_id, None)
-            return {
-                "action": "end",
-                "rationale": "Explicit opt-out or spam complaint. Sending stops immediately and this merchant is muted for proactive messages; no persuasion attempt is made.",
-            }
+            state["ended"] = True
+            return {"action": "end", "rationale": "Explicit opt-out: stop this recipient's messages without affecting other recipients."}
 
-        # 2. Answering machines: counted per merchant as well as per thread.
         if _matches_any(message, AUTO_REPLY_PATTERNS):
+            recipient = f"customer:{customer_id}" if is_customer else (merchant_id or body.conversation_id)
             thread = state.setdefault("auto_replies", Counter())
             thread[normalized] += 1
-            merchant_counter = STORE.auto_replies.setdefault(merchant_id or "unknown", Counter())
-            merchant_counter[normalized] += 1
-            count = max(thread[normalized], merchant_counter[normalized])
+            counter = STORE.auto_replies.setdefault(recipient, Counter())
+            counter[normalized] += 1
+            count = max(sum(thread.values()), sum(counter.values()))
             if count >= 3:
-                return {
-                    "action": "end",
-                    "rationale": "The same canned auto-reply has now come back three times across this merchant's threads; there is no human on the other end, so the sequence stops.",
-                }
+                return {"action": "end", "rationale": "Repeated automatic responses; end the sequence until a human replies."}
             if count == 2:
-                return {
-                    "action": "wait",
-                    "wait_seconds": 86_400,
-                    "rationale": "Second identical auto-reply. Waiting a day costs nothing and avoids burning a turn against an answering machine.",
-                }
-            return {
-                "action": "send",
-                "body": _finalize(voice.t(
-                    "Looks like an automatic response. No reply needed now — when the owner or manager sees this, reply YES and I will share the ready draft.",
-                    "Yeh automatic jawaab lag raha hai. Abhi reply ki zarurat nahi — jab owner ya manager dekhein, YES bhej dijiye, main ready draft bhej dungi.",
-                ), category),
-                "cta": "binary_yes_stop",
-                "rationale": "First canned response: one short owner-directed line, then back off rather than continue a conversation with a machine.",
-            }
+                return {"action": "wait", "wait_seconds": 86_400, "rationale": "Second automatic response; back off rather than continue an answering-machine loop."}
+            return send(voice.t("Thanks. When the owner or manager is available, they can reply here for the details.",
+                                "Shukriya. Owner ya manager available hon toh details ke liye yahin reply kar sakte hain."),
+                        "One short acknowledgement of the automatic response, then back off.")
 
-        # A genuine human reply clears the streak for this thread and merchant.
         if normalized:
             state.setdefault("auto_replies", Counter()).clear()
-            if merchant_id in STORE.auto_replies:
-                STORE.auto_replies[merchant_id].clear()
+            recipient = f"customer:{customer_id}" if is_customer else merchant_id
+            if recipient in STORE.auto_replies:
+                STORE.auto_replies[recipient].clear()
 
-        # 3. Commitment: move to delivery, never back to discovery.
-        if _matches_any(message, COMMIT_PATTERNS):
-            response_body = _strip_qualifiers(_commitment_response(category, merchant, trigger, body.turn_number))
-            return {
-                "action": "send",
-                "body": _finalize(response_body, category),
-                "cta": "binary_confirm_edit",
-                "rationale": "Explicit commitment detected, so the reply delivers the artifact instead of asking another qualifying question.",
-            }
-
-        # 4. Out of scope. Before the decline check, so a refusal carrying a
-        #    question still gets an answer.
-        if re.search(r"\b(gst|tax|itr|loan|legal|lawyer|passport|aadhaar|visa|insurance claim)\b", normalized):
-            return {
-                "action": "send",
-                "body": _finalize(voice.t(
-                    "That one belongs with your CA, not me — I would rather say so than guess. What I can do is your magicpin listing, "
-                    "customer messages, offers and post drafts. Reply DRAFT to carry on here, or STOP to close.",
-                    "Yeh kaam aapke CA ka hai, mera nahi — andaaza lagane se behtar hai saaf bata doon. Main jo kar sakti hoon: aapki magicpin listing, "
-                    "customer messages, offers aur post drafts. DRAFT bhejiye toh yahin aage badhein, ya STOP se band.",
-                ), category),
-                "cta": "binary_draft_stop",
-                "rationale": "Out-of-scope request is refused honestly instead of inventing capability, then routed back to one thing this assistant can actually deliver.",
-            }
-
-        # 5. A real question. Answer it before treating anything as a refusal.
-        if "?" in message or re.search(r"\b(what|how|why|when|where|which|kitna|kitne|kaise|kab|kyun|kya)\b", normalized):
-            perf_line = _perf_line(merchant or {}, voice)
-            basis = voice.t(
-                f"Working from your current numbers — {perf_line}." if perf_line else "Working from what is on your listing today.",
-                f"Main aapke current numbers par chal rahi hoon — {perf_line}." if perf_line else "Main aapki aaj ki listing par chal rahi hoon.",
-            )
-            return {
-                "action": "send",
-                "body": _finalize(voice.t(
-                    f"Fair question. {basis} The fastest way to answer it properly is to show you the actual draft — "
-                    "reply DRAFT and it is yours, or tell me the one detail you would change and I will build around that.",
-                    f"Sahi sawaal. {basis} Iska sabse achha jawaab hai aapko asli draft dikhana — "
-                    "DRAFT bhejiye, bhej deti hoon; ya jo ek cheez badalni hai woh bata dijiye, main usi hisaab se bana dungi.",
-                ), category),
-                "cta": "binary_draft_stop",
-                "rationale": "The question is answered on the merchant's own numbers and converted into one concrete next step rather than a longer explanation.",
-            }
-
-        # 6. A clean refusal with no question attached.
         if _matches_any(message, DECLINE_PATTERNS):
-            return {
-                "action": "end",
-                "rationale": "Clear decline with nothing left open. Ending here respects the answer; a second persuasion attempt would only cost goodwill.",
-            }
+            state["ended"] = True
+            return {"action": "end", "rationale": "The recipient declined; close the thread without further persuasion."}
 
-        if body.turn_number >= 5:
-            return {
-                "action": "end",
-                "rationale": "Five turns with no action signal. Continuing would be nudging, so the thread closes and the next opportunity can start fresh.",
-            }
+        delay = re.search(r"\b(?:in|after|wait|give me)\s+(\d+)\s*(minutes?|mins?|hours?|hrs?)\b", message, re.I)
+        if delay or re.search(r"\b(busy|later|tomorrow|baad mein|kal|not today)\b", normalized):
+            seconds = int(delay[1]) * (3600 if delay[2].lower().startswith(('h',)) else 60) if delay else (86_400 if re.search(r"\b(tomorrow|kal)\b", normalized) else 3600)
+            return {"action": "wait", "wait_seconds": max(60, min(seconds, 604800)), "rationale": "The recipient asked for time; defer instead of sending another pitch."}
 
-        options = [
-            voice.t(
-                "Got it. One useful next step from here: reply DRAFT and I will show you the copy, or STOP to close this.",
-                "Theek hai. Yahan se ek kaam ki cheez: DRAFT bhejiye, main copy dikha deti hoon — ya STOP se band kar dein.",
-            ),
-            voice.t(
-                "Understood. The draft is ready to show rather than describe. Reply DRAFT to see it, or STOP to close.",
-                "Samajh gayi. Draft batane se behtar dikhana hai. DRAFT bhejiye dekhne ke liye, ya STOP se band.",
-            ),
-            voice.t(
-                "Noted. I can put the final copy in front of you now. Reply DRAFT, or STOP.",
-                "Note kar liya. Final copy abhi aapke saamne rakh sakti hoon. DRAFT bhejiye, ya STOP.",
-            ),
-        ]
-        return {
-            "action": "send",
-            "body": _finalize(options[(body.turn_number - 1) % len(options)], category),
-            "cta": "binary_draft_stop",
-            "rationale": "Acknowledges the reply, advances exactly one step, and varies the wording so repeated turns do not read as a loop.",
-        }
+        if re.search(r"\b(gst|tax|itr|loan|legal|lawyer|passport|aadhaar|visa|insurance claim)\b", normalized):
+            # Tax details in a catering quote are in scope; filing or advice is not.
+            if re.search(r"\b(file|filing|return|advice|apply|application|loan|lawyer|passport|visa|insurance claim)\b", normalized):
+                specialist = voice.t("a qualified tax professional", "qualified tax professional") if re.search(r"\b(gst|tax|itr)\b", normalized) else voice.t("the relevant qualified adviser or official service", "relevant qualified adviser ya official service")
+                return send(voice.t(f"I cannot file or advise on that. Please use {specialist}. I can help prepare your listing copy, customer messages or offer drafts.",
+                                    f"Main uski filing ya advice nahi de sakti. {specialist} se help lijiye. Listing copy, customer messages ya offer drafts mein help kar sakti hoon."),
+                            "Routes an out-of-scope request honestly, even when it contains an action verb.")
+
+        if is_customer:
+            result = _customer_reply(state, message, voice)
+            return send(result["body"], result["rationale"], result["cta"])
+
+        if re.search(r"\b(join|sign up|signup|onboard|judna|judrna)\b", normalized):
+            return send(voice.t(
+                "Next step: open the official magicpin merchant registration flow and use your business name and owner contact details. I can help prepare your listing description here. I cannot create the account from this chat, and no registration link is supplied in your record.",
+                "Agla step: official magicpin merchant registration flow mein business name aur owner contact details use kijiye. Listing description yahan taiyar kar sakti hoon. Is chat se account create nahi kar sakti; record mein registration link supplied nahi hai."),
+                "Explicit joining intent gets onboarding steps immediately.")
+
+        if re.search(r"\b(edit|change|replace|instead|make it|shorter|shorten)\b", normalized) and state.get("delivered"):
+            replacement = re.search(r"replace\s+(.+?)\s+with\s+(.+?)[.!]?$", message, re.I)
+            if replacement and replacement[1].lower() in state["delivered"].lower():
+                edited = re.sub(re.escape(replacement[1]), lambda _: replacement[2], state["delivered"], flags=re.I)
+                state["delivered"] = edited
+                return send(edited, "Applied the merchant's explicit text replacement to the existing draft.")
+            if re.search(r"\b(shorter|shorten)\b", normalized):
+                edited = _post_draft(category, merchant, voice)
+                state["delivered"] = edited
+                return send(edited, "Provides a shorter usable post using the current merchant offer.")
+            return send(voice.t("Send the exact wording or detail to replace and its replacement; I will revise the draft shown above.",
+                                "Jo wording ya detail badalni hai aur uska replacement bhejiye; upar wala draft revise kar dungi."),
+                        "Asks only for the missing edit, without reopening qualification.")
+
+        if trigger.get("kind") == "ipl_match_today" and not state.get("delivered"):
+            cutoff = re.fullmatch(r"(?:order\s+)?(?:cutoff(?:\s+time)?\s*(?:is|:|at)?\s*)?(?:by\s+)?((?:0?[1-9]|1[0-2])(?::[0-5][0-9])?\s*[ap]m)[.! ]*", message, re.I)
+            if cutoff:
+                delivered = _match_draft(merchant, trigger, voice, cutoff[1])
+                state["delivered"] = delivered
+                return send(delivered, "Uses the supplied order cutoff and only an offer valid on the match date.")
+
+        if re.search(r"\b(price|cost|fee|charge|charges|kitna|kitne|pricing|free|source|proof|study|abstract|evidence|checklist|steps|register|registration)\b", normalized) or ("?" in message and not _matches_any(message, COMMIT_PATTERNS)):
+            return send(_question_response(category, merchant, trigger, message, voice), "Answers the specific question using supplied prices, sources and thread details.")
+
+        accepted = _matches_any(message, COMMIT_PATTERNS) or normalized in {"yes", "y", "ok", "okay", "sure", "send", "bhej do", "bhejo", "approved"}
+        if accepted:
+            if state.get("delivered") and re.search(r"\b(confirm|approve|approved|publish|post it|send it)\b", normalized):
+                state["approved"] = True
+                return send(voice.t("This version is approved in this chat. Copy the draft above into your posting or messaging tool to send it; I have not published or sent it externally.",
+                                    "Yeh version is chat mein approved hai. Bhejne ke liye upar wala draft posting ya messaging tool mein copy kijiye; maine externally publish ya send nahi kiya hai."),
+                            "Records approval and gives the real next step without claiming an external action.")
+            if state.get("delivered"):
+                return send(voice.t("The draft is above and ready for your review. Send the specific change you need, or use it once the details are checked.",
+                                    "Draft upar hai, review ke liye ready. Koi specific change ho toh bhejiye, warna details check karke use kijiye."),
+                            "Keeps the existing artifact instead of restarting the pitch or repeating it.")
+            delivered = _commitment_response(category, merchant, trigger, body.turn_number, customer, voice)
+            # On replay threads, retain a visible link to this merchant.
+            delivered = _ensure_anchor(delivered, merchant, voice)
+            state["delivered"] = delivered
+            return send(delivered, "Delivers actual copy, a checklist or steps in this turn; no empty promise or confirmation loop.")
+
+        if re.search(r"\b(thanks|thank you|thankyou|shukriya|done)\b", normalized) or body.turn_number >= 5:
+            return {"action": "end", "rationale": "Acknowledgement or exhausted conversation: close without another nudge."}
+        if re.search(r"\b(what|how|why|when|where|which|kaise|kab|kyun|kya)\b", normalized):
+            return send(_question_response(category, merchant, trigger, message, voice), "Answers the current question directly.")
+        # A merchant answering our one-item discovery question has provided the topic.
+        if trigger.get("kind") == "curious_ask_due":
+            draft = voice.t(f"Draft: “Interested in {message}? Message {_merchant_name(merchant)} for details, pricing and availability.” Confirm the service details before using it.",
+                            f"Draft: “{message} mein interest hai? Details, pricing aur availability ke liye {_merchant_name(merchant)} ko message kijiye.” Use karne se pehle service details confirm kijiye.")
+            state["delivered"] = draft
+            return send(draft, "Uses the merchant's answer as the topic and supplies the promised post immediately.")
+        return send(voice.t("Which detail needs changing: the service, price or timing? Send the correction and I will revise the copy.",
+                            "Kaunsi detail badalni hai: service, price ya timing? Correction bhejiye, copy revise kar dungi."),
+                    "One focused clarification when the reply does not identify an action.")
 
 
 @app.post("/v1/teardown")
