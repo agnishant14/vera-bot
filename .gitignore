@@ -9,3 +9,6 @@ __pycache__/
 judge-*-output.txt
 .env
 .venv/
+eval_results.json
+evaluate.py
+expanded/
